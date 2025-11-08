@@ -44,6 +44,22 @@ _BUTTON_KEYWORDS = (
     "ok",
 )
 _TEXTBOX_ALLOWED_CHARS = frozenset("_ .-‒–—=~·")
+_WIDGET_TYPE_MAP = {
+    "text": FieldType.TEXT,
+    "textarea": FieldType.TEXTBOX,
+    "textbox": FieldType.TEXTBOX,
+    "combobox": FieldType.TEXTBOX,
+    "combo": FieldType.TEXTBOX,
+    "choice": FieldType.TEXTBOX,
+    "listbox": FieldType.TEXTBOX,
+    "checkbox": FieldType.CHECKBOX,
+    "check": FieldType.CHECKBOX,
+    "radio": FieldType.RADIO,
+    "button": FieldType.BUTTON,
+    "pushbutton": FieldType.BUTTON,
+    "submit": FieldType.BUTTON,
+    "reset": FieldType.BUTTON,
+}
 
 PdfSource = Union[str, bytes, BinaryIO]
 
@@ -69,6 +85,34 @@ def _contains_field_marker(text: str) -> bool:
     if _BUTTON_PATTERN.search(stripped):
         return True
     return False
+
+
+def _map_widget_field_type(widget_type: Optional[Union[str, int]]) -> FieldType:
+    if widget_type is None:
+        return FieldType.UNKNOWN
+    normalized = str(widget_type).strip().lower()
+    return _WIDGET_TYPE_MAP.get(normalized, FieldType.UNKNOWN)
+
+
+def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> str:
+    base_label = (
+        getattr(widget, "field_label", None)
+        or getattr(widget, "field_name", None)
+        or getattr(widget, "name", None)
+    )
+    if not isinstance(base_label, str) or not base_label.strip():
+        base_label = f"Field {fallback_index}"
+    base_label = base_label.strip()
+    option_value = (
+        getattr(widget, "field_value", None)
+        or getattr(widget, "export_value", None)
+        or getattr(widget, "value", None)
+    )
+    if isinstance(option_value, str):
+        normalized_value = option_value.strip()
+        if normalized_value and normalized_value.lower() not in {"off", "false"}:
+            return f"{base_label} ({normalized_value})"
+    return base_label
 
 
 def _classify_marker_text(text: str) -> Optional[FieldType]:
@@ -176,6 +220,32 @@ def _extract_label(text: str) -> str:
         return text.split(":", 1)[0].strip()
     candidate = text.replace("_", " ").replace(".", " ")
     return candidate.strip().splitlines()[0][:64].strip()
+
+
+def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
+    fields: List[DetectedField] = []
+    for page_index in range(doc.page_count):
+        page = doc[page_index]
+        widgets = page.widgets()
+        if not widgets:
+            continue
+        for widget in widgets:
+            rect = getattr(widget, "rect", None)
+            if rect is None:
+                continue
+            label = _format_widget_label(widget, len(fields) + 1)
+            field_type = _map_widget_field_type(getattr(widget, "field_type", None))
+            bbox = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+            fields.append(
+                DetectedField(
+                    page=page_index,
+                    label=label,
+                    bbox=bbox,
+                    raw_label=label,
+                    field_type=field_type,
+                )
+            )
+    return fields
 
 
 def _collect_span_fields(doc: fitz.Document) -> List[DetectedField]:
@@ -318,10 +388,18 @@ def _collect_block_fields(doc: fitz.Document) -> List[DetectedField]:
 def extract_fields(source: PdfSource) -> List[DetectedField]:
     doc = fitz.open(stream=source, filetype="pdf") if not isinstance(source, str) else fitz.open(source)
     try:
-        fields = _collect_span_fields(doc)
-        if not fields:
-            fields = _collect_block_fields(doc)
-        return assign_unique_labels(fields)
+        collected_fields: List[DetectedField] = []
+        widget_fields = _collect_widget_fields(doc)
+        if widget_fields:
+            collected_fields.extend(widget_fields)
+
+        span_fields = _collect_span_fields(doc)
+        if span_fields:
+            collected_fields.extend(span_fields)
+        else:
+            collected_fields.extend(_collect_block_fields(doc))
+
+        return assign_unique_labels(collected_fields)
     finally:
         doc.close()
 
