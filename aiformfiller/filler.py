@@ -10,7 +10,6 @@ from typing import Any, BinaryIO, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import fitz
 
 from .models import DetectedField, FieldType
-from .filler_pypdf import fill_pdf_acroform
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
