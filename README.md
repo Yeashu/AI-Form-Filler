@@ -14,7 +14,8 @@ AIFormFiller/
 │   ├── parser.py          # PDF field extraction logic
 │   ├── filler.py          # PDF filling utilities
 │   ├── utils.py           # Helper functions (label disambiguation)
-│   └── pipeline.py        # High-level orchestration (parse + fill)
+│   ├── pipeline.py        # High-level orchestration (parse + fill + chat)
+│   └── llm.py             # Gemini-powered conversational engine
 ├── app.py                 # Streamlit UI (one-page flow)
 ├── output/                # Generated filled PDFs (gitignored)
 ├── requirements.txt       # Python dependencies
@@ -36,19 +37,24 @@ AIFormFiller/
    pip install -r requirements.txt
    ```
 
-3. **Run the Streamlit app:**
+3. **Configure your environment variables:**
+   ```fish
+   cp .env.example .env   # edit GOOGLE_API_KEY with your Gemini key
+   ```
+
+4. **Run the Streamlit app:**
    ```fish
    streamlit run app.py
    ```
 
-4. **Upload a PDF** with underline-based fields (e.g., `Name: ___________`), fill in the detected fields, and download the completed form.
+5. **Upload a PDF** with underline-based fields (e.g., `Name: ___________`). Choose **Form Mode** for manual entry or **Chat Mode** to collect answers via Gemini, then download the completed form.
 
 ---
 
 ## 🧩 Pipeline Overview
 
 ```
-PDF Upload → Parse (PyMuPDF) → Field Extraction → User Input → Fill PDF → Download
+PDF Upload → Parse (PyMuPDF) → Field Extraction → (Manual Form ⬅ or ➡ LLM Chat) → Fill PDF → Download
 ```
 
 ### Key Components
@@ -66,8 +72,14 @@ PDF Upload → Parse (PyMuPDF) → Field Extraction → User Input → Fill PDF 
    - Orchestrates parsing and filling operations
    - Manages PDF bytes and field mappings
 
-4. **Streamlit UI** (`app.py`)
+4. **LLM Conversation Layer** (`aiformfiller/llm.py` + `collect_answers_with_llm`)
+   - Sequential question/answer flow for each detected field
+   - Configurable Gemini prompts and optional validation
+   - Pure helper functions for easy testing
+
+5. **Streamlit UI** (`app.py`)
    - Single-page flow for upload, input, and download
+   - Mode selector for Form vs Chat input
    - Session state management for multi-step interaction
 
 ---
@@ -77,7 +89,7 @@ PDF Upload → Parse (PyMuPDF) → Field Extraction → User Input → Fill PDF 
 - Only detects `_____` or `......` style fields
 - No handwriting boxes, checkboxes, or OCR
 - No multilingual layout understanding
-- LLM integration planned for future versions
+- Requires Google Gemini API key for chat mode (manual form mode works offline)
 
 ---
 
@@ -85,7 +97,7 @@ PDF Upload → Parse (PyMuPDF) → Field Extraction → User Input → Fill PDF 
 
 - [x] Upload a clean PDF form
 - [x] Detect labeled fields automatically
-- [x] Collect info from user via simple form inputs
+- [x] Collect info from user via simple form inputs or conversational chat
 - [x] Insert responses at correct locations (above underlines)
 - [x] Download filled PDF
 - [x] Disambiguate duplicate field labels by index
@@ -129,7 +141,7 @@ See individual `GUIDELINES.md` files in each module for detailed best practices.
 
 ## 📝 Future Enhancements
 
-- [ ] LLM-driven conversational field collection
+- [x] LLM-driven conversational field collection
 - [x] Support for checkboxes and radio buttons (native AcroForm path)
 - [ ] OCR for scanned/image-based PDFs
 - [ ] Multi-page form navigation
