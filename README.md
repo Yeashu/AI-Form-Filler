@@ -8,14 +8,23 @@
 
 ```
 AIFormFiller/
-├── aiformfiller/          # Core package (modular components)
+├── aiformfiller/          # Legacy underline-based pipeline (still available)
 │   ├── __init__.py        # Package exports
-│   ├── models.py          # Data models (DetectedField)
-│   ├── parser.py          # PDF field extraction logic
-│   ├── filler.py          # PDF filling utilities
+│   ├── models.py          # PDF underline field data model
+│   ├── parser.py          # Underline-based PDF field extraction
+│   ├── filler.py          # Coordinate-based PDF filling utilities
 │   ├── utils.py           # Helper functions (label disambiguation)
-│   ├── pipeline.py        # High-level orchestration (parse + fill + chat)
-│   └── llm.py             # Gemini-powered conversational engine
+│   ├── pipeline.py        # Legacy orchestration (parse + fill + chat)
+│   └── llm.py             # Gemini-powered conversational engine (shared)
+├── services/              # HTML-based extraction + filling services
+│   ├── html_extractor.py  # PDF → HTML conversion (pdfplumber)
+│   ├── field_detector.py  # HTML field detection (BeautifulSoup)
+│   ├── html_filler.py     # HTML filling + WeasyPrint PDF generation
+│   ├── pipeline.py        # High-level HTML orchestration helpers
+│   └── __init__.py        # Service exports
+├── models/                # Shared data models (conversation state, etc.)
+│   ├── conversation_state.py
+│   └── __init__.py
 ├── app.py                 # Streamlit UI (one-page flow)
 ├── output/                # Generated filled PDFs (gitignored)
 ├── requirements.txt       # Python dependencies
@@ -54,33 +63,38 @@ AIFormFiller/
 ## 🧩 Pipeline Overview
 
 ```
-PDF Upload → Parse (PyMuPDF) → Field Extraction → (Manual Form ⬅ or ➡ LLM Chat) → Fill PDF → Download
+PDF Upload → Persist temp copy → PDF → HTML (pdfplumber) → HTML Field Detection (BeautifulSoup)
+→ (Manual Form ⬅ or ➡ LLM Chat) → HTML Fill + PDF render (WeasyPrint) → Download
 ```
 
 ### Key Components
 
-1. **Parser** (`aiformfiller/parser.py`)
-   - Extracts text blocks and spans using PyMuPDF
-   - Detects underline-based fields via pattern matching
-   - Falls back to word-level geometry when span detection fails
+1. **HTML Extractor** (`services/html_extractor.py`)
+   - Opens PDFs with pdfplumber
+   - Collects AcroForm metadata when available
+   - Generates an HTML `<form>` skeleton for downstream processing
 
-2. **Filler** (`aiformfiller/filler.py`)
-   - Inserts user-provided text at precise coordinates
-   - Positions text above underlines using bbox data
+2. **Field Detector** (`services/field_detector.py`)
+   - Parses HTML via BeautifulSoup
+   - Normalises `<input>`, `<select>`, and `<textarea>` controls into `DetectedField`
+   - Supports label lookups and metadata enrichment
 
-3. **Pipeline** (`aiformfiller/pipeline.py`)
-   - Orchestrates parsing and filling operations
-   - Manages PDF bytes and field mappings
+3. **HTML Filler** (`services/html_filler.py`)
+   - Injects collected answers into the HTML template
+   - Renders final PDFs using WeasyPrint while preserving structure
 
-4. **LLM Conversation Layer** (`aiformfiller/llm.py` + `collect_answers_with_llm`)
-   - Sequential question/answer flow for each detected field
-   - Configurable Gemini prompts and optional validation
-   - Pure helper functions for easy testing
+4. **HTML Pipeline** (`services/pipeline.py`)
+   - Coordinates extraction, conversation initialisation, filling, and preview generation
+   - Returns `FormExtractionResult` objects consumed by the UI
 
-5. **Streamlit UI** (`app.py`)
-   - Single-page flow for upload, input, and download
-   - Mode selector for Form vs Chat input
-   - Session state management for multi-step interaction
+5. **LLM Conversation Layer** (`aiformfiller/llm.py` + `models/conversation_state.py`)
+   - Shared between underline and HTML flows
+   - Sequential question/answer loop with optional Gemini validation
+
+6. **Streamlit UI** (`app.py`)
+   - Drives the new HTML pipeline
+   - Provides manual form and AI chat modes
+   - Manages session state (uploaded path, filled HTML/PDF, conversation history)
 
 ---
 
@@ -121,13 +135,14 @@ See individual `GUIDELINES.md` files in each module for detailed best practices.
 ## 🐛 Troubleshooting
 
 **No fields detected?**
-- Ensure your PDF has text blocks with `___` or `...` patterns
-- Check that fields follow the format: `Label: ___________`
-- Try PDFs with at least 3 consecutive underscores
+- Confirm the PDF exposes interactive fields (AcroForm) or embed clean text elements
+- Scanned/image-only PDFs currently fall back to plain text but yield no form controls
+- Try downloading the original digital copy rather than a scanned printout
 
-**Text alignment issues?**
-- Adjust `vertical_offset` and `horizontal_padding` in `filler.py`
-- Default: 3px above underline, 2px horizontal padding
+**Output PDF formatting off?**
+- Ensure WeasyPrint native dependencies (Pango, Cairo) are installed on your system
+- Validate the HTML produced by `services/html_extractor.py` to confirm structure
+- Custom fonts may require additional CSS in the HTML template
 
 **Dependencies not installing?**
 - Ensure you're using Python 3.10+

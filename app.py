@@ -2,30 +2,79 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Sequence
+import tempfile
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from aiformfiller.pipeline import (
-    ParsedForm,
-    collect_answers_with_llm,
-    fill_parsed_form,
-    parse_pdf,
+from aiformfiller.llm import (
+    configure_gemini,
+    create_conversation,
+    get_next_question,
+    process_user_response,
 )
+from services import FormPipeline, FormExtractionResult
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 load_dotenv()
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+FORM_PIPELINE = FormPipeline()
+
+
+def _persist_pdf(bytes_data: bytes, original_name: str) -> str:
+    """Write uploaded PDF bytes to a temporary location and return the path."""
+
+    temp_dir = OUTPUT_DIR / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(original_name).suffix or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=temp_dir) as tmp_file:
+        tmp_file.write(bytes_data)
+        return tmp_file.name
+
+
+def _cleanup_previous_upload() -> None:
+    """Delete the last persisted upload if one exists."""
+
+    path = st.session_state.get("uploaded_pdf_path")
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+    st.session_state.uploaded_pdf_path = None
+
+
+def _map_answers_to_field_names(extracted: FormExtractionResult, answers: Dict[str, str]) -> Dict[str, str]:
+    """Convert label-keyed answers into name-keyed answers expected by HTML filler."""
+
+    mapping: Dict[str, str] = {}
+    for field in extracted.fields:
+        name_key = field.name or field.label
+        if not name_key:
+            continue
+        label_key = field.label or field.name
+        if label_key and label_key in answers:
+            mapping[name_key] = answers[label_key]
+        elif field.name and field.name in answers:
+            mapping[name_key] = answers[field.name]
+    return mapping
+
 
 def _init_session_state() -> None:
     defaults = {
-        "parsed_form": None,
+        "extracted_form": None,
         "uploaded_filename": None,
+        "uploaded_pdf_path": None,
         "answers": {},
         "filled_pdf_bytes": None,
         "filled_pdf_name": None,
@@ -33,6 +82,7 @@ def _init_session_state() -> None:
         "conversation_state": None,
         "pending_answers": {},
         "awaiting_confirmation": False,
+        "filled_html": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -41,13 +91,15 @@ def _init_session_state() -> None:
 
 def _reset_state_on_new_upload(filename: str) -> None:
     if st.session_state.uploaded_filename != filename:
-        st.session_state.parsed_form = None
+        _cleanup_previous_upload()
+        st.session_state.extracted_form = None
         st.session_state.answers = {}
         st.session_state.filled_pdf_bytes = None
         st.session_state.filled_pdf_name = None
         st.session_state.conversation_state = None
         st.session_state.pending_answers = {}
         st.session_state.awaiting_confirmation = False
+        st.session_state.filled_html = None
         st.session_state.uploaded_filename = filename
 
 
@@ -57,8 +109,27 @@ def _build_output_path(upload_name: str | None) -> Path:
     return OUTPUT_DIR / f"{stem}_filled_{timestamp}.pdf"
 
 
-def _stage_answers_for_confirmation(answers: Dict[str, str]) -> None:
+def _normalise_answers(fields: Sequence, raw_answers: Dict[str, str]) -> Dict[str, str]:
+    """Return a mapping keyed by HTML field name using any available labels."""
+
+    normalised: Dict[str, str] = {}
+    for field in fields:
+        if not getattr(field, "name", None):
+            continue
+        label = field.label or field.name or ""
+        if field.name in raw_answers:
+            normalised[field.name] = raw_answers[field.name]
+        elif label and label in raw_answers:
+            normalised[field.name] = raw_answers[label]
+    return normalised
+
+
+def _stage_answers_for_confirmation(fields: Sequence, answers: Dict[str, str]) -> None:
     if not answers:
+        return
+
+    normalised = _normalise_answers(fields, answers)
+    if not normalised:
         return
 
     pending = st.session_state.pending_answers or {}
@@ -67,29 +138,34 @@ def _stage_answers_for_confirmation(answers: Dict[str, str]) -> None:
     if (
         not st.session_state.awaiting_confirmation
         and st.session_state.filled_pdf_bytes
-        and answers == existing
+        and normalised == existing
     ):
         # Answers already confirmed and unchanged; skip restaging.
         return
 
-    if st.session_state.awaiting_confirmation and answers == pending:
+    if st.session_state.awaiting_confirmation and normalised == pending:
         return
 
-    st.session_state.pending_answers = answers.copy()
+    st.session_state.pending_answers = normalised.copy()
     st.session_state.awaiting_confirmation = True
-    st.session_state.answers = answers.copy()
+    st.session_state.answers = normalised.copy()
     st.session_state.filled_pdf_bytes = None
     st.session_state.filled_pdf_name = None
 
 
-def _finalise_pdf(parsed_form: ParsedForm, answers: Dict[str, str]) -> None:
+def _finalise_pdf(extracted: FormExtractionResult, answers: Dict[str, str]) -> None:
     output_path = _build_output_path(st.session_state.uploaded_filename)
-    fill_parsed_form(parsed_form, answers, output_path.as_posix())
-    with output_path.open("rb") as fp:
+    name_mapped_answers = _map_answers_to_field_names(extracted, answers)
+    if not name_mapped_answers:
+        st.warning("No answers available to fill the form.")
+        return
+    filled_html, pdf_path = FORM_PIPELINE.fill(extracted, name_mapped_answers, output_path.as_posix())
+    with Path(pdf_path).open("rb") as fp:
         filled_bytes = fp.read()
 
     st.session_state.filled_pdf_bytes = filled_bytes
-    st.session_state.filled_pdf_name = output_path.name
+    st.session_state.filled_pdf_name = Path(pdf_path).name
+    st.session_state.filled_html = filled_html
     st.session_state.awaiting_confirmation = False
     st.session_state.pending_answers = {}
     st.session_state.answers = answers.copy()
@@ -97,29 +173,36 @@ def _finalise_pdf(parsed_form: ParsedForm, answers: Dict[str, str]) -> None:
     st.success("PDF filled successfully. Download below.")
 
 
-def _render_field_inputs(parsed_form: ParsedForm) -> None:
+def _render_field_inputs(extracted: FormExtractionResult) -> None:
     st.subheader("Provide Field Values")
     answers: Dict[str, str] = {}
     with st.form("field_input_form"):
-        for field in parsed_form.fields:
-            default_value = st.session_state.answers.get(field.label, "")
-            answers[field.label] = st.text_input(field.label, value=default_value)
+        for index, field in enumerate(extracted.fields):
+            label = field.label or field.name or "Field"
+            answer_key = field.name or (field.label or f"field_{index}")
+            session_answers = st.session_state.answers or {}
+            if field.name and field.name in session_answers:
+                default_value = session_answers[field.name]
+            elif field.label and field.label in session_answers:
+                default_value = session_answers[field.label]
+            else:
+                default_value = field.value or ""
+            widget_key = f"field_input_{index}_{field.name or 'unnamed'}"
+            answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
         submitted = st.form_submit_button("Review Answers")
     if submitted:
-        st.session_state.answers = answers
-        _stage_answers_for_confirmation(answers)
+        _stage_answers_for_confirmation(extracted.fields, answers)
         st.rerun()
     return None
 
 
-def _render_chat_interface(parsed_form: ParsedForm) -> None:
+def _render_chat_interface(extracted: FormExtractionResult) -> None:
     """Collect answers through a conversational interface."""
 
-    # Initialise or resume the conversation state stored in the session.
     state = st.session_state.conversation_state
     if state is None:
         try:
-            state = collect_answers_with_llm(parsed_form, validate_with_llm=True)
+            configure_gemini()
         except ValueError:
             st.error(
                 "Chat Mode requires a valid GOOGLE_API_KEY. "
@@ -127,21 +210,25 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
                 icon="⚠️",
             )
             st.session_state.input_mode = "form"
-            st.session_state.conversation_state = None
-            return {}
+            return
+        state = create_conversation(extracted.fields)
+        state = replace(
+            state,
+            form_name=str(extracted.metadata.get("form_name", "")),
+            html_template=extracted.html_template,
+        )
+        first_question = get_next_question(state)
+        history = state.conversation_history
+        if not history or history[-1].get("content") != first_question:
+            history = history + [{"role": "assistant", "content": first_question}]
+        state = replace(state, conversation_history=history)
         st.session_state.conversation_state = state
 
-    user_message = None
     if not state.is_complete:
         user_message = st.chat_input("Type your response")
         if user_message:
             try:
-                state = collect_answers_with_llm(
-                    parsed_form,
-                    existing_state=state,
-                    user_input=user_message,
-                    validate_with_llm=True,
-                )
+                state = process_user_response(state, user_message, validate_with_llm=True)
             except ValueError:
                 st.error(
                     "Gemini API key missing. Switching back to Form Mode so you can continue.",
@@ -149,7 +236,7 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
                 )
                 st.session_state.input_mode = "form"
                 st.session_state.conversation_state = None
-                return {}
+                return
             st.session_state.conversation_state = state
 
     for message in state.conversation_history:
@@ -160,15 +247,14 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
 
     if state.is_complete:
         st.success("All details collected. Review and continue below.")
-        st.session_state.answers = state.collected_answers
-        _stage_answers_for_confirmation(state.collected_answers)
+        _stage_answers_for_confirmation(extracted.fields, state.collected_answers)
         for label, value in state.collected_answers.items():
             st.markdown(f"- **{label}**: {value}")
 
     return None
 
 
-def _render_confirmation(parsed_form: ParsedForm) -> None:
+def _render_confirmation(extracted: FormExtractionResult) -> None:
     if not st.session_state.awaiting_confirmation:
         return
 
@@ -178,10 +264,11 @@ def _render_confirmation(parsed_form: ParsedForm) -> None:
         return
 
     st.subheader("Review Your Answers")
-    for field in parsed_form.fields:
-        value = answers.get(field.label, "")
+    for field in extracted.fields:
+        label = field.label or field.name or "Field"
+        value = answers.get(field.name) or answers.get(label, "")
         display_value = value if value else "_Not provided_"
-        st.markdown(f"- **{field.label}**: {display_value}")
+        st.markdown(f"- **{label}**: {display_value}")
 
     col_confirm, col_edit = st.columns(2)
     confirm_clicked = col_confirm.button(
@@ -195,7 +282,7 @@ def _render_confirmation(parsed_form: ParsedForm) -> None:
     )
 
     if confirm_clicked:
-        _finalise_pdf(parsed_form, answers)
+        _finalise_pdf(extracted, answers)
         return
 
     if edit_clicked:
@@ -214,7 +301,7 @@ def main() -> None:
 
     st.title("AI Form Filler MVP")
     st.write(
-        "Upload a clean digital PDF with underline-style fields. We'll detect the fields, ask "
+        "Upload a clean digital PDF form. We'll convert it to HTML, detect the fields, ask "
         "for the values, and produce a filled PDF."
     )
 
@@ -227,22 +314,47 @@ def main() -> None:
     _reset_state_on_new_upload(uploaded_pdf.name)
     pdf_bytes = uploaded_pdf.getvalue()
 
-    if st.session_state.parsed_form is None:
-        parsed_form = parse_pdf(pdf_bytes)
-        st.session_state.parsed_form = parsed_form
-    else:
-        parsed_form = st.session_state.parsed_form
+    if st.session_state.uploaded_pdf_path is None:
+        st.session_state.uploaded_pdf_path = _persist_pdf(pdf_bytes, uploaded_pdf.name)
+    pdf_path = st.session_state.uploaded_pdf_path
 
-    if not parsed_form.fields:
-        st.warning("No underline-based fields were detected. The PDF may not match the MVP constraints.")
+    if st.session_state.extracted_form is None:
+        extracted_form = FORM_PIPELINE.extract(pdf_path)
+        st.session_state.extracted_form = extracted_form
+    else:
+        extracted_form = st.session_state.extracted_form
+
+    if not extracted_form.fields:
+        st.warning("No interactive fields were detected. The PDF may not match the current capabilities.")
+        metadata = extracted_form.metadata or {}
+        if metadata:
+            st.info(
+                "Debug info: "
+                f"title={metadata.get('form_name')}, pages={metadata.get('num_pages')}, "
+                f"has_form_fields={metadata.get('has_form_fields')}"
+            )
+        st.markdown(
+            "Possible causes:\n"
+            "- The PDF is a scanned image without interactive form controls.\n"
+            "- The form fields were flattened during export (no AcroForm data).\n"
+            "- The PDF uses custom widgets unsupported by pdfplumber/WeasyPrint."
+        )
         return
+
+    metadata = extracted_form.metadata
+    if metadata:
+        st.caption(
+            f"Form detected: {metadata.get('form_name', 'Unknown')} • Pages: {metadata.get('num_pages', 'n/a')}"
+        )
 
     st.subheader("Detected Fields")
     st.dataframe(
         {
-            "Field": [field.label for field in parsed_form.fields],
-            "Page": [field.page + 1 for field in parsed_form.fields],
-            "BBox": [field.bbox for field in parsed_form.fields],
+            "Label": [field.label or "" for field in extracted_form.fields],
+            "Name": [field.name or "" for field in extracted_form.fields],
+            "Type": [field.field_type for field in extracted_form.fields],
+            "Required": ["Yes" if field.required else "No" for field in extracted_form.fields],
+            "Placeholder": [field.placeholder or "" for field in extracted_form.fields],
         }
     )
 
@@ -259,15 +371,14 @@ def main() -> None:
     new_mode = "form" if selected_label == mode_labels[0] else "chat"
     if st.session_state.input_mode != new_mode:
         st.session_state.input_mode = new_mode
-        if new_mode == "form":
-            st.session_state.conversation_state = None
+        st.session_state.conversation_state = None
 
     if st.session_state.input_mode == "chat":
-        _render_chat_interface(parsed_form)
+        _render_chat_interface(extracted_form)
     else:
-        _render_field_inputs(parsed_form)
+        _render_field_inputs(extracted_form)
 
-    _render_confirmation(parsed_form)
+    _render_confirmation(extracted_form)
 
     if st.session_state.filled_pdf_bytes and not st.session_state.awaiting_confirmation:
         st.download_button(

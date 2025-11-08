@@ -17,31 +17,12 @@ from typing import Optional
 import google.generativeai as genai
 
 from .models import DetectedField
+from models.conversation_state import ConversationState
 
 logger = logging.getLogger(__name__)
 
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO)
-
-
-@dataclass(frozen=True)
-class ConversationState:
-    """Immutable state of a form-filling conversation.
-
-    Attributes:
-        fields: List of all fields that need to be filled.
-        collected_answers: Dictionary mapping field labels to user responses.
-        current_field_index: Index of the field currently being asked about.
-        conversation_history: List of chat messages for display.
-        is_complete: Whether all fields have been collected.
-    """
-
-    fields: list[DetectedField]
-    collected_answers: dict[str, str]
-    current_field_index: int
-    conversation_history: list[dict[str, str]]
-    is_complete: bool = False
-
 
 @dataclass(frozen=True)
 class FieldExpectation:
