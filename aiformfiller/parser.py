@@ -94,7 +94,23 @@ def _map_widget_field_type(widget_type: Optional[Union[str, int]]) -> FieldType:
     return _WIDGET_TYPE_MAP.get(normalized, FieldType.UNKNOWN)
 
 
-def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> str:
+def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
+    candidates = (
+        getattr(widget, "export_value", None),
+        getattr(widget, "export", None),
+        getattr(widget, "value", None),
+        getattr(widget, "field_value", None),
+        getattr(widget, "field_default", None),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped:
+                return stripped
+    return None
+
+
+def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> Tuple[str, str, Optional[str]]:
     base_label = (
         getattr(widget, "field_label", None)
         or getattr(widget, "field_name", None)
@@ -103,16 +119,12 @@ def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> str:
     if not isinstance(base_label, str) or not base_label.strip():
         base_label = f"Field {fallback_index}"
     base_label = base_label.strip()
-    option_value = (
-        getattr(widget, "field_value", None)
-        or getattr(widget, "export_value", None)
-        or getattr(widget, "value", None)
-    )
+    option_value = _extract_widget_option_value(widget)
     if isinstance(option_value, str):
         normalized_value = option_value.strip()
         if normalized_value and normalized_value.lower() not in {"off", "false"}:
-            return f"{base_label} ({normalized_value})"
-    return base_label
+            return f"{base_label} ({normalized_value})", base_label, normalized_value
+    return base_label, base_label, None
 
 
 def _classify_marker_text(text: str) -> Optional[FieldType]:
@@ -233,9 +245,15 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
             rect = getattr(widget, "rect", None)
             if rect is None:
                 continue
-            label = _format_widget_label(widget, len(fields) + 1)
+            label, base_label, option_value = _format_widget_label(widget, len(fields) + 1)
             field_type = _map_widget_field_type(getattr(widget, "field_type", None))
             bbox = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+            raw_group_key = getattr(widget, "field_name", None)
+            if isinstance(raw_group_key, str):
+                raw_group_key = raw_group_key.strip() or None
+            group_key = raw_group_key or base_label
+            if field_type != FieldType.RADIO:
+                group_key = None
             fields.append(
                 DetectedField(
                     page=page_index,
@@ -243,6 +261,8 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
                     bbox=bbox,
                     raw_label=label,
                     field_type=field_type,
+                    group_key=group_key,
+                    export_value=option_value,
                 )
             )
     return fields

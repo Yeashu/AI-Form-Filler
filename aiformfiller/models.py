@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class FieldType(str, Enum):
@@ -28,3 +28,5 @@ class DetectedField:
     bbox: BBox
     raw_label: str
     field_type: FieldType = FieldType.TEXT
+    group_key: Optional[str] = None
+    export_value: Optional[str] = None
