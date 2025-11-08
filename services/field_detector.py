@@ -77,7 +77,8 @@ class FieldDetector:
             )
 
         if element.name == "textarea":
-            value = element.get_text(strip=True)
+            raw_text = element.get_text() or ""
+            value = raw_text.replace("\r\n", "\n").strip("\n")
             return DetectedField(
                 name=name,
                 label=label,

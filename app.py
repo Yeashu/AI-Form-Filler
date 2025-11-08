@@ -187,8 +187,40 @@ def _render_field_inputs(extracted: FormExtractionResult) -> None:
                 default_value = session_answers[field.label]
             else:
                 default_value = field.value or ""
+
+            layout = extracted.field_layouts.get(field.name or answer_key)
             widget_key = f"field_input_{index}_{field.name or 'unnamed'}"
-            answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
+
+            if layout and layout.kind == "grid":
+                max_chars = layout.columns if layout.columns > 0 else None
+                help_text = "Characters will be distributed across the boxes."
+                if layout.columns:
+                    help_text = f"Enter up to {layout.columns} characters; blanks will clear remaining boxes."
+                text_kwargs = {
+                    "label": label,
+                    "value": default_value,
+                    "key": widget_key,
+                    "help": help_text,
+                }
+                if max_chars is not None:
+                    text_kwargs["max_chars"] = max_chars
+                answers[answer_key] = st.text_input(**text_kwargs)
+            elif layout and layout.kind == "table":
+                answers[answer_key] = st.text_area(
+                    label,
+                    value=default_value,
+                    key=widget_key,
+                    height=140,
+                    help="Use commas or tabs to separate columns and new lines for rows.",
+                )
+            elif field.field_type == "textarea":
+                answers[answer_key] = st.text_area(
+                    label,
+                    value=default_value,
+                    key=widget_key,
+                )
+            else:
+                answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
         submitted = st.form_submit_button("Review Answers")
     if submitted:
         _stage_answers_for_confirmation(extracted.fields, answers)
@@ -268,6 +300,15 @@ def _render_confirmation(extracted: FormExtractionResult) -> None:
         label = field.label or field.name or "Field"
         value = answers.get(field.name) or answers.get(label, "")
         display_value = value if value else "_Not provided_"
+        layout = extracted.field_layouts.get(field.name or label)
+        if layout and layout.kind == "table":
+            st.markdown(f"**{label}**")
+            if value:
+                st.text(value)
+            else:
+                st.markdown("_Not provided_")
+            continue
+
         st.markdown(f"- **{label}**: {display_value}")
 
     col_confirm, col_edit = st.columns(2)
@@ -348,6 +389,7 @@ def main() -> None:
         )
 
     st.subheader("Detected Fields")
+    layouts = extracted_form.field_layouts
     st.dataframe(
         {
             "Label": [field.label or "" for field in extracted_form.fields],
@@ -355,6 +397,10 @@ def main() -> None:
             "Type": [field.field_type for field in extracted_form.fields],
             "Required": ["Yes" if field.required else "No" for field in extracted_form.fields],
             "Placeholder": [field.placeholder or "" for field in extracted_form.fields],
+            "Layout": [
+                (layouts[field.name].kind if field.name in layouts else "single")
+                for field in extracted_form.fields
+            ],
         }
     )
 
