@@ -44,7 +44,7 @@ _BUTTON_KEYWORDS = (
     "ok",
 )
 _TEXTBOX_ALLOWED_CHARS = frozenset("_ .-‒–—=~·")
-_WIDGET_TYPE_MAP = {
+_WIDGET_TYPE_MAP_STR = {
     "text": FieldType.TEXT,
     "textarea": FieldType.TEXTBOX,
     "textbox": FieldType.TEXTBOX,
@@ -55,11 +55,25 @@ _WIDGET_TYPE_MAP = {
     "checkbox": FieldType.CHECKBOX,
     "check": FieldType.CHECKBOX,
     "radio": FieldType.RADIO,
+    "radiobutton": FieldType.RADIO,
     "button": FieldType.BUTTON,
     "pushbutton": FieldType.BUTTON,
     "submit": FieldType.BUTTON,
     "reset": FieldType.BUTTON,
 }
+_WIDGET_TYPE_MAP_INT: Dict[int, FieldType] = {}
+_WIDGET_INT_PAIRS = {
+    "PDF_WIDGET_TYPE_TEXT": FieldType.TEXT,
+    "PDF_WIDGET_TYPE_CHECKBOX": FieldType.CHECKBOX,
+    "PDF_WIDGET_TYPE_RADIOBUTTON": FieldType.RADIO,
+    "PDF_WIDGET_TYPE_BUTTON": FieldType.BUTTON,
+    "PDF_WIDGET_TYPE_COMBOBOX": FieldType.TEXTBOX,
+    "PDF_WIDGET_TYPE_LISTBOX": FieldType.TEXTBOX,
+}
+for attr_name, field_type in _WIDGET_INT_PAIRS.items():
+    value = getattr(fitz, attr_name, None)
+    if isinstance(value, int):
+        _WIDGET_TYPE_MAP_INT[value] = field_type
 
 PdfSource = Union[str, bytes, BinaryIO]
 
@@ -87,11 +101,42 @@ def _contains_field_marker(text: str) -> bool:
     return False
 
 
-def _map_widget_field_type(widget_type: Optional[Union[str, int]]) -> FieldType:
-    if widget_type is None:
-        return FieldType.UNKNOWN
-    normalized = str(widget_type).strip().lower()
-    return _WIDGET_TYPE_MAP.get(normalized, FieldType.UNKNOWN)
+def _detect_button_subtype(widget: fitz.Widget) -> Optional[FieldType]:
+    button_type = getattr(widget, "button_type", None)
+    if isinstance(button_type, str):
+        normalized = button_type.strip().lower()
+        if normalized in {"check", "checkbox"}:
+            return FieldType.CHECKBOX
+        if normalized in {"radio", "radiobutton"}:
+            return FieldType.RADIO
+    field_flags = getattr(widget, "field_flags", None)
+    if isinstance(field_flags, int):
+        # PDF spec: radio flag bit 15, pushbutton bit 16
+        if field_flags & (1 << 15):
+            return FieldType.RADIO
+        if field_flags & (1 << 16):
+            return FieldType.BUTTON
+        # Checkbox is default button when not radio / push
+        if getattr(widget, "field_type", None) in (getattr(fitz, "PDF_WIDGET_TYPE_BUTTON", None), "button"):
+            return FieldType.CHECKBOX
+    return None
+
+
+def _map_widget_field_type(widget: fitz.Widget) -> FieldType:
+    widget_type = getattr(widget, "field_type", None)
+    if isinstance(widget_type, int):
+        mapped = _WIDGET_TYPE_MAP_INT.get(widget_type)
+        if mapped:
+            return mapped
+    if isinstance(widget_type, str):
+        normalized = widget_type.strip().lower()
+        mapped = _WIDGET_TYPE_MAP_STR.get(normalized)
+        if mapped:
+            return mapped
+    subtype = _detect_button_subtype(widget)
+    if subtype:
+        return subtype
+    return FieldType.UNKNOWN
 
 
 def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
@@ -246,7 +291,7 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
             if rect is None:
                 continue
             label, base_label, option_value = _format_widget_label(widget, len(fields) + 1)
-            field_type = _map_widget_field_type(getattr(widget, "field_type", None))
+            field_type = _map_widget_field_type(widget)
             bbox = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
             raw_group_key = getattr(widget, "field_name", None)
             if isinstance(raw_group_key, str):
