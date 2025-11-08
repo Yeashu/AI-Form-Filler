@@ -7,11 +7,19 @@ from pathlib import Path
 from typing import Dict
 
 import streamlit as st
+from dotenv import load_dotenv
 
-from aiformfiller.pipeline import ParsedForm, fill_parsed_form, parse_pdf
+from aiformfiller.pipeline import (
+    ParsedForm,
+    collect_answers_with_llm,
+    fill_parsed_form,
+    parse_pdf,
+)
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+load_dotenv()
 
 
 def _init_session_state() -> None:
@@ -21,6 +29,10 @@ def _init_session_state() -> None:
         "answers": {},
         "filled_pdf_bytes": None,
         "filled_pdf_name": None,
+        "input_mode": "form",
+        "conversation_state": None,
+        "pending_answers": {},
+        "awaiting_confirmation": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -33,6 +45,9 @@ def _reset_state_on_new_upload(filename: str) -> None:
         st.session_state.answers = {}
         st.session_state.filled_pdf_bytes = None
         st.session_state.filled_pdf_name = None
+        st.session_state.conversation_state = None
+        st.session_state.pending_answers = {}
+        st.session_state.awaiting_confirmation = False
         st.session_state.uploaded_filename = filename
 
 
@@ -42,35 +57,155 @@ def _build_output_path(upload_name: str | None) -> Path:
     return OUTPUT_DIR / f"{stem}_filled_{timestamp}.pdf"
 
 
-def _render_field_inputs(parsed_form: ParsedForm) -> Dict[str, str]:
+def _stage_answers_for_confirmation(answers: Dict[str, str]) -> None:
+    if not answers:
+        return
+
+    pending = st.session_state.pending_answers or {}
+    existing = st.session_state.answers or {}
+
+    if (
+        not st.session_state.awaiting_confirmation
+        and st.session_state.filled_pdf_bytes
+        and answers == existing
+    ):
+        # Answers already confirmed and unchanged; skip restaging.
+        return
+
+    if st.session_state.awaiting_confirmation and answers == pending:
+        return
+
+    st.session_state.pending_answers = answers.copy()
+    st.session_state.awaiting_confirmation = True
+    st.session_state.answers = answers.copy()
+    st.session_state.filled_pdf_bytes = None
+    st.session_state.filled_pdf_name = None
+
+
+def _finalise_pdf(parsed_form: ParsedForm, answers: Dict[str, str]) -> None:
+    output_path = _build_output_path(st.session_state.uploaded_filename)
+    fill_parsed_form(parsed_form, answers, output_path.as_posix())
+    with output_path.open("rb") as fp:
+        filled_bytes = fp.read()
+
+    st.session_state.filled_pdf_bytes = filled_bytes
+    st.session_state.filled_pdf_name = output_path.name
+    st.session_state.awaiting_confirmation = False
+    st.session_state.pending_answers = {}
+    st.session_state.answers = answers.copy()
+
+    st.success("PDF filled successfully. Download below.")
+
+
+def _render_field_inputs(parsed_form: ParsedForm) -> None:
     st.subheader("Provide Field Values")
     answers: Dict[str, str] = {}
     with st.form("field_input_form"):
         for field in parsed_form.fields:
             default_value = st.session_state.answers.get(field.label, "")
             answers[field.label] = st.text_input(field.label, value=default_value)
-        submitted = st.form_submit_button("Fill PDF")
+        submitted = st.form_submit_button("Review Answers")
     if submitted:
         st.session_state.answers = answers
-    return answers if submitted else {}
+        _stage_answers_for_confirmation(answers)
+        st.rerun()
+    return None
 
 
-def _maybe_render_results(filled_answers: Dict[str, str], parsed_form: ParsedForm) -> None:
-    if not filled_answers:
+def _render_chat_interface(parsed_form: ParsedForm) -> None:
+    """Collect answers through a conversational interface."""
+
+    # Initialise or resume the conversation state stored in the session.
+    state = st.session_state.conversation_state
+    if state is None:
+        try:
+            state = collect_answers_with_llm(parsed_form, validate_with_llm=True)
+        except ValueError:
+            st.error(
+                "Chat Mode requires a valid GOOGLE_API_KEY. "
+                "Please add it to your environment or switch back to Form Mode.",
+                icon="⚠️",
+            )
+            st.session_state.input_mode = "form"
+            st.session_state.conversation_state = None
+            return {}
+        st.session_state.conversation_state = state
+
+    user_message = None
+    if not state.is_complete:
+        user_message = st.chat_input("Type your response")
+        if user_message:
+            try:
+                state = collect_answers_with_llm(
+                    parsed_form,
+                    existing_state=state,
+                    user_input=user_message,
+                    validate_with_llm=True,
+                )
+            except ValueError:
+                st.error(
+                    "Gemini API key missing. Switching back to Form Mode so you can continue.",
+                    icon="⚠️",
+                )
+                st.session_state.input_mode = "form"
+                st.session_state.conversation_state = None
+                return {}
+            st.session_state.conversation_state = state
+
+    for message in state.conversation_history:
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
+        with st.chat_message("user" if role == "user" else "assistant"):
+            st.markdown(content)
+
+    if state.is_complete:
+        st.success("All details collected. Review and continue below.")
+        st.session_state.answers = state.collected_answers
+        _stage_answers_for_confirmation(state.collected_answers)
+        for label, value in state.collected_answers.items():
+            st.markdown(f"- **{label}**: {value}")
+
+    return None
+
+
+def _render_confirmation(parsed_form: ParsedForm) -> None:
+    if not st.session_state.awaiting_confirmation:
         return
-    output_path = _build_output_path(st.session_state.uploaded_filename)
-    fill_parsed_form(parsed_form, filled_answers, output_path.as_posix())
-    with output_path.open("rb") as fp:
-        filled_bytes = fp.read()
-    st.session_state.filled_pdf_bytes = filled_bytes
-    st.session_state.filled_pdf_name = output_path.name
-    st.success("PDF filled successfully. Download below.")
-    st.download_button(
-        label="Download Filled PDF",
-        data=filled_bytes,
-        file_name=output_path.name,
-        mime="application/pdf",
+
+    answers = st.session_state.pending_answers or {}
+    if not answers:
+        st.session_state.awaiting_confirmation = False
+        return
+
+    st.subheader("Review Your Answers")
+    for field in parsed_form.fields:
+        value = answers.get(field.label, "")
+        display_value = value if value else "_Not provided_"
+        st.markdown(f"- **{field.label}**: {display_value}")
+
+    col_confirm, col_edit = st.columns(2)
+    confirm_clicked = col_confirm.button(
+        "Confirm & Fill PDF",
+        type="primary",
+        key="confirm_fill_pdf",
     )
+    edit_clicked = col_edit.button(
+        "Edit Answers",
+        key="edit_answers_button",
+    )
+
+    if confirm_clicked:
+        _finalise_pdf(parsed_form, answers)
+        return
+
+    if edit_clicked:
+        st.session_state.awaiting_confirmation = False
+        st.session_state.pending_answers = answers.copy()
+        st.session_state.filled_pdf_bytes = None
+        st.session_state.filled_pdf_name = None
+        st.session_state.input_mode = "form"
+        st.session_state.conversation_state = None
+        st.rerun()
 
 
 def main() -> None:
@@ -111,12 +246,30 @@ def main() -> None:
         }
     )
 
-    filled_answers = _render_field_inputs(parsed_form)
+    st.subheader("Choose Input Mode")
+    mode_labels = ("Form Mode (Manual)", "Chat Mode (AI Assistant)")
+    current_index = 0 if st.session_state.input_mode == "form" else 1
+    selected_label = st.radio(
+        "Input method",
+        options=mode_labels,
+        index=current_index,
+        horizontal=True,
+        key="input_mode_selector",
+    )
+    new_mode = "form" if selected_label == mode_labels[0] else "chat"
+    if st.session_state.input_mode != new_mode:
+        st.session_state.input_mode = new_mode
+        if new_mode == "form":
+            st.session_state.conversation_state = None
 
-    if filled_answers:
-        _maybe_render_results(filled_answers, parsed_form)
-    elif st.session_state.filled_pdf_bytes:
-        st.info("Using previously filled PDF.")
+    if st.session_state.input_mode == "chat":
+        _render_chat_interface(parsed_form)
+    else:
+        _render_field_inputs(parsed_form)
+
+    _render_confirmation(parsed_form)
+
+    if st.session_state.filled_pdf_bytes and not st.session_state.awaiting_confirmation:
         st.download_button(
             label="Download Filled PDF",
             data=st.session_state.filled_pdf_bytes,
