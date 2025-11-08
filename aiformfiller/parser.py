@@ -13,6 +13,7 @@ from .utils import assign_unique_labels
 
 _FIELD_REGEX = re.compile(r"([^:\n]+)\s*:\s*(?:_{3,}|\.{3,})")
 _UNDERLINE_MARKERS = ("___", "...", "____")
+_UNDERLINE_TOKEN_PATTERN = re.compile(r"(?:_{3,}|\.{3,})")
 _CHECKBOX_PATTERN = re.compile(r"\[\s*(?:[xX✓✔✗✘]?)\s*\]")
 _RADIO_PATTERN = re.compile(r"\(\s*(?:[xXoO•●]?)\s*\)")
 _TEXTBOX_PATTERN = re.compile(
@@ -82,7 +83,7 @@ def _classify_marker_text(text: str) -> Optional[FieldType]:
         return FieldType.CHECKBOX
     if any(ch in _RADIO_GLYPHS for ch in stripped):
         return FieldType.RADIO
-    if _is_underline_token(stripped):
+    if _UNDERLINE_TOKEN_PATTERN.search(stripped):
         return FieldType.TEXT
     return None
 
