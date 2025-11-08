@@ -17,6 +17,7 @@ from aiformfiller.pipeline import (
     fill_parsed_form,
     parse_pdf,
 )
+from aiformfiller.storage import SecureStorage, StorageError
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -38,6 +39,9 @@ def _init_session_state() -> None:
         "conversation_state": None,
         "pending_answers": {},
         "awaiting_confirmation": False,
+        "storage_password": None,
+        "stored_data": {},
+        "save_to_storage": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -171,6 +175,14 @@ def _render_checkbox_field(field: DetectedField) -> str:
 
 def _render_text_field(field: DetectedField) -> str:
     default_value = st.session_state.answers.get(field.label, "")
+    
+    # Try to get auto-fill suggestion from storage
+    storage = st.session_state.get("_secure_storage_instance")
+    if not default_value and st.session_state.stored_data and storage:
+        suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
+        if suggestion:
+            default_value = suggestion
+    
     if field.field_type == FieldType.TEXTBOX:
         result = st.text_area(field.label, value=default_value)
         return result if result is not None else ""
@@ -200,6 +212,15 @@ def _render_field_inputs(parsed_form: ParsedForm) -> None:
                 answers[field.label] = ""
             else:
                 answers[field.label] = _render_text_field(field)
+        
+        # Add option to save to storage
+        if st.session_state.storage_password:
+            st.session_state.save_to_storage = st.checkbox(
+                "💾 Save responses to encrypted storage for future use",
+                value=st.session_state.save_to_storage,
+                help="Your data will be encrypted and stored locally"
+            )
+        
         submitted = st.form_submit_button("Review Answers")
     if submitted:
         st.session_state.answers = answers
@@ -317,11 +338,31 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
     if state is None:
         # Prepare simplified field list for chat (deduplicate radio groups)
         chat_fields = _prepare_fields_for_chat(parsed_form.fields)
+        
+        # Pre-fill with stored data if available
+        initial_answers = {}
+        if st.session_state.stored_data:
+            storage = st.session_state.get("_secure_storage_instance")
+            if storage:
+                for field in chat_fields:
+                    suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
+                    if suggestion:
+                        initial_answers[field.label] = suggestion
+        
         try:
             # Create a temporary ParsedForm with chat-friendly fields
             from dataclasses import replace as dc_replace
             chat_form = dc_replace(parsed_form, fields=chat_fields)
             state = collect_answers_with_llm(chat_form, validate_with_llm=True)
+            
+            # Apply pre-filled answers if we have them
+            if initial_answers:
+                from dataclasses import replace
+                state = replace(
+                    state,
+                    collected_answers={**initial_answers, **state.collected_answers}
+                )
+                st.info(f"🔓 Auto-filled {len(initial_answers)} field(s) from storage")
         except ValueError:
             st.error(
                 "Chat Mode requires a valid GOOGLE_API_KEY. "
@@ -369,6 +410,16 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
         # Expand chat answers to match all form fields (handle radio groups and checkboxes)
         expanded_answers = _expand_chat_answers_to_form_fields(state.collected_answers, parsed_form.fields)
         st.session_state.answers = expanded_answers
+        
+        # Option to save chat answers
+        if st.session_state.storage_password:
+            st.session_state.save_to_storage = st.checkbox(
+                "💾 Save responses to encrypted storage for future use",
+                value=st.session_state.save_to_storage,
+                help="Your data will be encrypted and stored locally",
+                key="chat_save_checkbox"
+            )
+        
         _stage_answers_for_confirmation(expanded_answers)
         
         # Display what was collected in chat
@@ -414,6 +465,23 @@ def _render_confirmation(parsed_form: ParsedForm) -> None:
     )
 
     if confirm_clicked:
+        # Save to storage if requested
+        if st.session_state.save_to_storage and st.session_state.storage_password:
+            try:
+                storage = st.session_state.get("_secure_storage_instance")
+                # Filter out empty values and special symbols
+                data_to_save = {
+                    k: v for k, v in answers.items() 
+                    if v and v not in {_CHECKED_SYMBOL, _RADIO_SYMBOL, ""}
+                }
+                if data_to_save and storage:
+                    storage.save_answers(data_to_save, st.session_state.storage_password)
+                    # Reload stored data immediately so it's available for next form
+                    st.session_state.stored_data = storage.load_answers(st.session_state.storage_password)
+                    st.success(f"💾 Saved {len(data_to_save)} field(s) to encrypted storage!")
+            except StorageError as e:
+                st.warning(f"Could not save to storage: {e}")
+        
         _finalise_pdf(parsed_form, answers)
         return
 
@@ -430,6 +498,73 @@ def _render_confirmation(parsed_form: ParsedForm) -> None:
 def main() -> None:
     st.set_page_config(page_title="AI Form Filler", page_icon="📝", layout="wide")
     _init_session_state()
+
+    # Create and cache SecureStorage instance in session state
+    if "_secure_storage_instance" not in st.session_state:
+        st.session_state["_secure_storage_instance"] = SecureStorage()
+    storage = st.session_state["_secure_storage_instance"]
+
+    # Sidebar for storage settings
+    with st.sidebar:
+        st.header("🔒 Secure Storage")
+        
+        # Check if data exists
+        if storage.has_stored_data():
+            st.success("✓ Encrypted profile found")
+        else:
+            st.info("No saved profile yet")
+        
+        # Password input
+        if not st.session_state.storage_password:
+            password = st.text_input(
+                "Storage Password",
+                type="password",
+                help="Enter password to unlock auto-fill. Your data is encrypted locally.",
+                key="password_input"
+            )
+            if password:
+                try:
+                    # Try to load data with this password
+                    stored_data = storage.load_answers(password)
+                    st.session_state.storage_password = password
+                    st.session_state.stored_data = stored_data
+                    st.success(f"✓ Unlocked! {len(stored_data)} field(s) available")
+                    st.rerun()
+                except StorageError:
+                    if storage.has_stored_data():
+                        st.error("Invalid password")
+                    else:
+                        # New profile - accept any password
+                        st.session_state.storage_password = password
+                        st.session_state.stored_data = {}
+                        st.success("Password set for new profile")
+                        st.rerun()
+        else:
+            st.success(f"🔓 Unlocked ({len(st.session_state.stored_data)} fields)")
+            if st.button("🔒 Lock Storage"):
+                st.session_state.storage_password = None
+                st.session_state.stored_data = {}
+                st.session_state.save_to_storage = False
+                st.rerun()
+        
+        # Storage management
+        if st.session_state.storage_password:
+            st.divider()
+            with st.expander("📋 Stored Fields"):
+                if st.session_state.stored_data:
+                    for label, value in st.session_state.stored_data.items():
+                        st.text(f"• {label}")
+                        st.caption(f"  {value[:50]}..." if len(value) > 50 else f"  {value}")
+                else:
+                    st.caption("No fields stored yet")
+            
+            if storage.has_stored_data() and st.button("🗑️ Delete All Data", type="secondary"):
+                storage.delete_all_data()
+                st.session_state.storage_password = None
+                st.session_state.stored_data = {}
+                st.session_state.save_to_storage = False
+                st.success("All data deleted")
+                st.rerun()
 
     st.title("AI Form Filler MVP")
     st.write(
