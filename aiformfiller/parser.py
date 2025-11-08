@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import re
-from typing import BinaryIO, Dict, Iterator, List, Optional, Tuple, Union
+from typing import BinaryIO, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import fitz
 
@@ -44,18 +44,33 @@ _BUTTON_KEYWORDS = (
     "ok",
 )
 _TEXTBOX_ALLOWED_CHARS = frozenset("_ .-‒–—=~·")
+WordTuple = Tuple[float, float, float, float, str, int, int, int]
+
+
+def _prettify_label(text: str) -> str:
+    cleaned = text.replace("_", " ").replace("-", " ").strip()
+    if not cleaned:
+        return text.strip()
+    if cleaned.islower():
+        return cleaned.title()
+    return cleaned
+
+
 _WIDGET_TYPE_MAP_STR = {
     "text": FieldType.TEXT,
+    "tx": FieldType.TEXT,
     "textarea": FieldType.TEXTBOX,
     "textbox": FieldType.TEXTBOX,
     "combobox": FieldType.TEXTBOX,
     "combo": FieldType.TEXTBOX,
     "choice": FieldType.TEXTBOX,
     "listbox": FieldType.TEXTBOX,
+    "ch": FieldType.TEXTBOX,
     "checkbox": FieldType.CHECKBOX,
     "check": FieldType.CHECKBOX,
     "radio": FieldType.RADIO,
     "radiobutton": FieldType.RADIO,
+    "btn": FieldType.BUTTON,
     "button": FieldType.BUTTON,
     "pushbutton": FieldType.BUTTON,
     "submit": FieldType.BUTTON,
@@ -117,7 +132,10 @@ def _detect_button_subtype(widget: fitz.Widget) -> Optional[FieldType]:
         if field_flags & (1 << 16):
             return FieldType.BUTTON
         # Checkbox is default button when not radio / push
-        if getattr(widget, "field_type", None) in (getattr(fitz, "PDF_WIDGET_TYPE_BUTTON", None), "button"):
+        field_type_value = getattr(widget, "field_type", None)
+        is_button_constant = field_type_value == getattr(fitz, "PDF_WIDGET_TYPE_BUTTON", None)
+        is_button_string = isinstance(field_type_value, str) and field_type_value.strip().lower() in {"button", "btn"}
+        if is_button_constant or is_button_string:
             return FieldType.CHECKBOX
     return None
 
@@ -127,16 +145,147 @@ def _map_widget_field_type(widget: fitz.Widget) -> FieldType:
     if isinstance(widget_type, int):
         mapped = _WIDGET_TYPE_MAP_INT.get(widget_type)
         if mapped:
+            if mapped == FieldType.BUTTON:
+                subtype = _detect_button_subtype(widget)
+                if subtype:
+                    return subtype
             return mapped
     if isinstance(widget_type, str):
         normalized = widget_type.strip().lower()
         mapped = _WIDGET_TYPE_MAP_STR.get(normalized)
         if mapped:
+            if mapped == FieldType.BUTTON:
+                subtype = _detect_button_subtype(widget)
+                if subtype:
+                    return subtype
             return mapped
     subtype = _detect_button_subtype(widget)
     if subtype:
         return subtype
     return FieldType.UNKNOWN
+
+
+def _extract_words(page: fitz.Page) -> List[WordTuple]:
+    words_raw = page.get_text("words")
+    if not isinstance(words_raw, list):
+        return []
+    words: List[WordTuple] = []
+    for word in words_raw:
+        if not isinstance(word, (list, tuple)) or len(word) < 8:
+            continue
+        try:
+            words.append(
+                (
+                    float(word[0]),
+                    float(word[1]),
+                    float(word[2]),
+                    float(word[3]),
+                    str(word[4]),
+                    int(word[5]),
+                    int(word[6]),
+                    int(word[7]),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return words
+
+
+def _group_words_by_block(words: Sequence[WordTuple]) -> Dict[int, List[WordTuple]]:
+    grouped: Dict[int, List[WordTuple]] = defaultdict(list)
+    for word in words:
+        grouped[word[5]].append(word)
+    return grouped
+
+
+def _clean_word_text(text: str) -> str:
+    return text.strip().strip(":").strip()
+
+
+def _collect_phrase(
+    words: Sequence[WordTuple],
+    start_index: int,
+    direction: int,
+    baseline: float,
+    max_words: int,
+    max_gap: float,
+    vertical_tolerance: float,
+) -> str:
+    parts: List[str] = []
+    idx = start_index
+    last_edge: Optional[float] = None
+    consumed = 0
+    while 0 <= idx < len(words) and consumed < max_words:
+        wx0, wy0, wx1, wy1, wtext, *_ = words[idx]
+        word_mid = (wy0 + wy1) / 2.0
+        if abs(word_mid - baseline) > vertical_tolerance:
+            break
+        if last_edge is not None:
+            gap = (wx0 - last_edge) if direction > 0 else (last_edge - wx1)
+            if gap > max_gap:
+                break
+        cleaned = _clean_word_text(wtext)
+        if cleaned:
+            if direction > 0:
+                parts.append(cleaned)
+            else:
+                parts.insert(0, cleaned)
+        last_edge = wx1 if direction > 0 else wx0
+        idx += direction
+        consumed += 1
+    return " ".join(parts).strip()
+
+
+def _find_adjacent_label_text(
+    words: Sequence[WordTuple],
+    rect: Tuple[float, float, float, float],
+    side: str,
+    max_distance: float = 80.0,
+    vertical_tolerance: float = 6.0,
+) -> Optional[str]:
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
+    x0, y0, x1, y1 = rect
+    best: Optional[Tuple[float, str]] = None
+    for idx, word in enumerate(words):
+        wx0, wy0, wx1, wy1, wtext, *_ = word
+        if not wtext or not wtext.strip():
+            continue
+        if wy1 < y0 - vertical_tolerance or wy0 > y1 + vertical_tolerance:
+            continue
+        if side == "right":
+            if wx0 < x1 or wx0 - x1 > max_distance:
+                continue
+            distance = wx0 - x1
+            phrase = _collect_phrase(
+                words,
+                idx,
+                1,
+                baseline=(wy0 + wy1) / 2.0,
+                max_words=4,
+                max_gap=12.0,
+                vertical_tolerance=vertical_tolerance,
+            )
+        else:
+            if wx1 > x0 or x0 - wx1 > max_distance:
+                continue
+            distance = x0 - wx1
+            phrase = _collect_phrase(
+                words,
+                idx,
+                -1,
+                baseline=(wy0 + wy1) / 2.0,
+                max_words=6,
+                max_gap=12.0,
+                vertical_tolerance=vertical_tolerance,
+            )
+        if not phrase:
+            continue
+        if best is None or distance < best[0]:
+            best = (distance, phrase)
+    if best is None:
+        return None
+    return best[1]
 
 
 def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
@@ -155,12 +304,9 @@ def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
     return None
 
 
-def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> Tuple[str, str, Optional[str]]:
-    base_label = (
-        getattr(widget, "field_label", None)
-        or getattr(widget, "field_name", None)
-        or getattr(widget, "name", None)
-    )
+def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> Tuple[str, str, Optional[str], Optional[str]]:
+    field_name = getattr(widget, "field_name", None)
+    base_label = getattr(widget, "field_label", None) or field_name or getattr(widget, "name", None)
     if not isinstance(base_label, str) or not base_label.strip():
         base_label = f"Field {fallback_index}"
     base_label = base_label.strip()
@@ -168,8 +314,8 @@ def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> Tuple[str,
     if isinstance(option_value, str):
         normalized_value = option_value.strip()
         if normalized_value and normalized_value.lower() not in {"off", "false"}:
-            return f"{base_label} ({normalized_value})", base_label, normalized_value
-    return base_label, base_label, None
+            return f"{base_label} ({normalized_value})", base_label, normalized_value, field_name
+    return base_label, base_label, None, field_name
 
 
 def _classify_marker_text(text: str) -> Optional[FieldType]:
@@ -283,6 +429,7 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
     fields: List[DetectedField] = []
     for page_index in range(doc.page_count):
         page = doc[page_index]
+        words = _extract_words(page)
         widgets = page.widgets()
         if not widgets:
             continue
@@ -290,24 +437,48 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
             rect = getattr(widget, "rect", None)
             if rect is None:
                 continue
-            label, base_label, option_value = _format_widget_label(widget, len(fields) + 1)
+            initial_label, base_label, option_value, field_name = _format_widget_label(widget, len(fields) + 1)
+            pretty_base = _prettify_label(base_label)
             field_type = _map_widget_field_type(widget)
             bbox = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
-            raw_group_key = getattr(widget, "field_name", None)
-            if isinstance(raw_group_key, str):
+            option_label = option_value
+            display_label = initial_label
+
+            if field_type == FieldType.RADIO:
+                if not option_label:
+                    option_label = _find_adjacent_label_text(words, bbox, side="right")
+                if option_label:
+                    display_label = f"{pretty_base} ({option_label})"
+                else:
+                    display_label = pretty_base
+            elif field_type == FieldType.CHECKBOX:
+                if not option_label:
+                    option_label = _find_adjacent_label_text(words, bbox, side="right")
+                display_label = option_label or pretty_base
+                option_label = option_label or pretty_base
+            elif field_type in {FieldType.TEXT, FieldType.TEXTBOX}:
+                text_label = _find_adjacent_label_text(words, bbox, side="left")
+                if text_label:
+                    display_label = text_label
+                else:
+                    display_label = pretty_base
+            else:
+                display_label = _prettify_label(initial_label)
+
+            raw_group_key = field_name if isinstance(field_name, str) else None
+            if raw_group_key:
                 raw_group_key = raw_group_key.strip() or None
-            group_key = raw_group_key or base_label
-            if field_type != FieldType.RADIO:
-                group_key = None
+            group_key = raw_group_key if field_type == FieldType.RADIO else None
             fields.append(
                 DetectedField(
                     page=page_index,
-                    label=label,
+                    label=display_label,
                     bbox=bbox,
-                    raw_label=label,
+                    raw_label=display_label,
                     field_type=field_type,
                     group_key=group_key,
-                    export_value=option_value,
+                    export_value=option_label,
+                    form_field_name=raw_group_key,
                 )
             )
     return fields
@@ -345,7 +516,7 @@ def _is_underline_token(text: str) -> bool:
 
 
 def _locate_underline_bbox(
-    words: List[Tuple[float, float, float, float, str, int, int, int]],
+    words: Sequence[WordTuple],
     block_bbox: Tuple[float, float, float, float],
 ) -> Optional[Tuple[float, float, float, float]]:
     x0, y0, x1, y1 = block_bbox
@@ -365,7 +536,7 @@ def _locate_underline_bbox(
 
 
 def _collect_symbol_bboxes(
-    words: List[Tuple[float, float, float, float, str, int, int, int]],
+    words: Sequence[WordTuple],
 ) -> Dict[FieldType, List[Tuple[float, float, float, float]]]:
     symbols: Dict[FieldType, List[Tuple[float, float, float, float]]] = defaultdict(list)
     for word in words:
@@ -381,27 +552,8 @@ def _collect_block_fields(doc: fitz.Document) -> List[DetectedField]:
     fields: List[DetectedField] = []
     for page_index in range(doc.page_count):
         page = doc[page_index]
-        words_raw = page.get_text("words")
-        if not isinstance(words_raw, list):
-            continue
-        words = [
-            (
-                float(word[0]),
-                float(word[1]),
-                float(word[2]),
-                float(word[3]),
-                str(word[4]),
-                int(word[5]),
-                int(word[6]),
-                int(word[7]),
-            )
-            for word in words_raw
-            if isinstance(word, (list, tuple)) and len(word) >= 8
-        ]
-        words_by_block: Dict[int, List[Tuple[float, float, float, float, str, int, int, int]]] = defaultdict(list)
-        for word in words:
-            block_id = word[5]
-            words_by_block[block_id].append(word)
+        words = _extract_words(page)
+        words_by_block = _group_words_by_block(words)
 
         blocks_raw = page.get_text("blocks")
         if not isinstance(blocks_raw, list):

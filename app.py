@@ -15,7 +15,7 @@ from aiformfiller.pipeline import ParsedForm, fill_parsed_form, parse_pdf
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 _RADIO_NONE_OPTION = "— No selection —"
-_CHECKED_SYMBOL = "☒"
+_CHECKED_SYMBOL = "X"
 _RADIO_SYMBOL = "●"
 
 
@@ -57,6 +57,14 @@ def _group_radio_fields(fields: List[DetectedField]) -> Dict[str, List[DetectedF
     return groups
 
 
+def _format_group_title(field: DetectedField) -> str:
+    source = field.group_key or field.raw_label or field.label
+    cleaned = (source or "").replace("_", " ").strip().strip(":")
+    if not cleaned:
+        return "Selection"
+    return cleaned[0].upper() + cleaned[1:]
+
+
 def _radio_option_label(field: DetectedField) -> str:
     if field.export_value and field.export_value.lower() not in {"off", "false"}:
         return field.export_value
@@ -75,8 +83,7 @@ def _render_radio_group(group_key: str, group_fields: List[DetectedField]) -> st
     options = [_RADIO_NONE_OPTION] + option_labels
     default_label = _radio_group_default_selection(group_fields)
     default_index = options.index(default_label) if default_label in options else 0
-    title_source = group_fields[0]
-    title = title_source.raw_label or title_source.label
+    title = _format_group_title(group_fields[0])
     return st.radio(
         title,
         options=options,

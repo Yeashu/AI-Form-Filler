@@ -30,3 +30,4 @@ class DetectedField:
     field_type: FieldType = FieldType.TEXT
     group_key: Optional[str] = None
     export_value: Optional[str] = None
+    form_field_name: Optional[str] = None
