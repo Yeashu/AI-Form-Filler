@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Set
 
 import streamlit as st
 from dotenv import load_dotenv
 
+from aiformfiller.models import DetectedField, FieldType
 from aiformfiller.pipeline import (
     ParsedForm,
     collect_answers_with_llm,
@@ -18,6 +20,9 @@ from aiformfiller.pipeline import (
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
+_RADIO_NONE_OPTION = "— No selection —"
+_CHECKED_SYMBOL = "X"
+_RADIO_SYMBOL = "●"
 
 load_dotenv()
 
@@ -97,13 +102,104 @@ def _finalise_pdf(parsed_form: ParsedForm, answers: Dict[str, str]) -> None:
     st.success("PDF filled successfully. Download below.")
 
 
+def _group_radio_fields(fields: List[DetectedField]) -> Dict[str, List[DetectedField]]:
+    groups: Dict[str, List[DetectedField]] = defaultdict(list)
+    for field in fields:
+        if field.field_type != FieldType.RADIO:
+            continue
+        group_key = field.group_key or field.raw_label or field.label
+        groups[group_key].append(field)
+    return groups
+
+
+def _format_group_title(field: DetectedField) -> str:
+    source = field.group_key or field.raw_label or field.label
+    cleaned = (source or "").replace("_", " ").strip().strip(":")
+    if not cleaned:
+        return "Selection"
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def _radio_option_label(field: DetectedField) -> str:
+    if field.export_value and field.export_value.lower() not in {"off", "false"}:
+        return field.export_value
+    return field.label
+
+
+def _radio_group_default_selection(group_fields: List[DetectedField]) -> str:
+    for field in group_fields:
+        if st.session_state.answers.get(field.label):
+            return _radio_option_label(field)
+    return _RADIO_NONE_OPTION
+
+
+def _render_radio_group(group_key: str, group_fields: List[DetectedField]) -> str:
+    option_labels = [_radio_option_label(field) for field in group_fields]
+    options = [_RADIO_NONE_OPTION] + option_labels
+    default_label = _radio_group_default_selection(group_fields)
+    default_index = options.index(default_label) if default_label in options else 0
+    title = _format_group_title(group_fields[0])
+    return st.radio(
+        title,
+        options=options,
+        index=default_index,
+        key=f"radio_{group_key}",
+    )
+
+
+def _radio_group_answers(group_fields: List[DetectedField], selection: str) -> Dict[str, str]:
+    answers: Dict[str, str] = {}
+    if selection == _RADIO_NONE_OPTION:
+        for field in group_fields:
+            answers[field.label] = ""
+        return answers
+    for field in group_fields:
+        option_label = _radio_option_label(field)
+        answers[field.label] = _RADIO_SYMBOL if option_label == selection else ""
+    return answers
+
+
+def _render_checkbox_field(field: DetectedField) -> str:
+    default_checked = bool(st.session_state.answers.get(field.label))
+    checked = st.checkbox(
+        field.label,
+        value=default_checked,
+        key=f"checkbox_{field.label}",
+    )
+    return _CHECKED_SYMBOL if checked else ""
+
+
+def _render_text_field(field: DetectedField) -> str:
+    default_value = st.session_state.answers.get(field.label, "")
+    if field.field_type == FieldType.TEXTBOX:
+        result = st.text_area(field.label, value=default_value)
+        return result if result is not None else ""
+    result = st.text_input(field.label, value=default_value)
+    return result if result is not None else ""
+
+
 def _render_field_inputs(parsed_form: ParsedForm) -> None:
     st.subheader("Provide Field Values")
     answers: Dict[str, str] = {}
+    radio_groups = _group_radio_fields(parsed_form.fields)
+    processed_radio_groups: Set[str] = set()
     with st.form("field_input_form"):
         for field in parsed_form.fields:
-            default_value = st.session_state.answers.get(field.label, "")
-            answers[field.label] = st.text_input(field.label, value=default_value)
+            if field.field_type == FieldType.RADIO:
+                group_key = field.group_key or field.raw_label or field.label
+                if group_key in processed_radio_groups:
+                    continue
+                group_fields = radio_groups.get(group_key, [field])
+                selection = _render_radio_group(group_key, group_fields)
+                answers.update(_radio_group_answers(group_fields, selection))
+                processed_radio_groups.add(group_key)
+            elif field.field_type == FieldType.CHECKBOX:
+                answers[field.label] = _render_checkbox_field(field)
+            elif field.field_type == FieldType.BUTTON:
+                st.caption(f"{field.label} (button field)")
+                answers[field.label] = ""
+            else:
+                answers[field.label] = _render_text_field(field)
         submitted = st.form_submit_button("Review Answers")
     if submitted:
         st.session_state.answers = answers
@@ -128,7 +224,7 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
             )
             st.session_state.input_mode = "form"
             st.session_state.conversation_state = None
-            return {}
+            return
         st.session_state.conversation_state = state
 
     user_message = None
@@ -149,7 +245,7 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
                 )
                 st.session_state.input_mode = "form"
                 st.session_state.conversation_state = None
-                return {}
+                return
             st.session_state.conversation_state = state
 
     for message in state.conversation_history:
@@ -157,6 +253,15 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
         content = message.get("content", "")
         with st.chat_message("user" if role == "user" else "assistant"):
             st.markdown(content)
+
+    if state.is_complete:
+        st.success("All details collected. Review and continue below.")
+        st.session_state.answers = state.collected_answers
+        _stage_answers_for_confirmation(state.collected_answers)
+        for label, value in state.collected_answers.items():
+            st.markdown(f"- **{label}**: {value}")
+
+    return None
 
     if state.is_complete:
         st.success("All details collected. Review and continue below.")
