@@ -208,14 +208,120 @@ def _render_field_inputs(parsed_form: ParsedForm) -> None:
     return None
 
 
+def _prepare_fields_for_chat(fields: List[DetectedField]) -> List[DetectedField]:
+    """Filter and prepare fields for chat mode by deduplicating radio groups and checkboxes.
+    
+    Returns a simplified list where radio button groups are represented by a single field.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    seen_groups: Set[str] = set()
+    chat_fields: List[DetectedField] = []
+    
+    logger.info(f"[Chat] Preparing {len(fields)} fields for chat mode")
+    
+    for field in fields:
+        if field.field_type == FieldType.RADIO:
+            # Use group_key or raw_label to identify radio groups
+            group_key = field.group_key or field.raw_label or field.label
+            if group_key in seen_groups:
+                logger.debug(f"[Chat] Skipping duplicate radio option: {field.label} (group: {group_key})")
+                continue  # Skip duplicate radio options in the same group
+            seen_groups.add(group_key)
+            logger.info(f"[Chat] Including radio group: {group_key} (first option: {field.label})")
+            chat_fields.append(field)
+        else:
+            # Include all other field types (TEXT, CHECKBOX, TEXTBOX, etc.)
+            logger.debug(f"[Chat] Including field: {field.label} (type: {field.field_type})")
+            chat_fields.append(field)
+    
+    logger.info(f"[Chat] Prepared {len(chat_fields)} fields for chat (reduced from {len(fields)})")
+    return chat_fields
+
+
+def _expand_chat_answers_to_form_fields(
+    chat_answers: Dict[str, str], 
+    all_fields: List[DetectedField]
+) -> Dict[str, str]:
+    """Expand chat answers to match all form fields, handling radio groups and checkboxes.
+    
+    Args:
+        chat_answers: Answers collected from chat (one per radio group)
+        all_fields: All detected fields including all radio options
+        
+    Returns:
+        Expanded answers dict with entries for all fields
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    expanded: Dict[str, str] = {}
+    radio_groups = _group_radio_fields(all_fields)
+    
+    logger.info(f"[Chat] Expanding {len(chat_answers)} chat answers to {len(all_fields)} form fields")
+    logger.debug(f"[Chat] Chat answers: {chat_answers}")
+    
+    for field in all_fields:
+        if field.field_type == FieldType.RADIO:
+            # Find the answer for this radio group
+            group_key = field.group_key or field.raw_label or field.label
+            group_fields = radio_groups.get(group_key, [field])
+            
+            # Check if we have an answer for any field in this group
+            chat_value = None
+            for gf in group_fields:
+                if gf.label in chat_answers:
+                    chat_value = chat_answers[gf.label]
+                    break
+            
+            if not chat_value:
+                expanded[field.label] = ""
+                logger.debug(f"[Chat] Radio field '{field.label}' - no answer found")
+                continue
+                
+            # Determine which option was selected
+            option_label = _radio_option_label(field)
+            # Check if the user's answer matches this option
+            if chat_value.lower() in option_label.lower() or option_label.lower() in chat_value.lower():
+                expanded[field.label] = _RADIO_SYMBOL
+                logger.info(f"[Chat] Radio field '{field.label}' = '{_RADIO_SYMBOL}' (matched '{chat_value}')")
+            else:
+                expanded[field.label] = ""
+                logger.debug(f"[Chat] Radio field '{field.label}' = '' ('{chat_value}' != '{option_label}')")
+                
+        elif field.field_type == FieldType.CHECKBOX:
+            # Convert yes/no or similar responses to X or empty
+            chat_value = chat_answers.get(field.label, "").strip().lower()
+            if chat_value in {"yes", "y", "true", "1", "checked", "x"}:
+                expanded[field.label] = _CHECKED_SYMBOL
+                logger.info(f"[Chat] Checkbox field '{field.label}' = '{_CHECKED_SYMBOL}' ('{chat_value}')")
+            else:
+                expanded[field.label] = ""
+                logger.debug(f"[Chat] Checkbox field '{field.label}' = '' ('{chat_value}')")
+        else:
+            # Regular text fields - copy as is
+            expanded[field.label] = chat_answers.get(field.label, "")
+            if field.label in chat_answers:
+                logger.info(f"[Chat] Text field '{field.label}' = '{expanded[field.label]}'")
+    
+    logger.info(f"[Chat] Expanded to {len(expanded)} field values")
+    return expanded
+
+
 def _render_chat_interface(parsed_form: ParsedForm) -> None:
     """Collect answers through a conversational interface."""
 
     # Initialise or resume the conversation state stored in the session.
     state = st.session_state.conversation_state
     if state is None:
+        # Prepare simplified field list for chat (deduplicate radio groups)
+        chat_fields = _prepare_fields_for_chat(parsed_form.fields)
         try:
-            state = collect_answers_with_llm(parsed_form, validate_with_llm=True)
+            # Create a temporary ParsedForm with chat-friendly fields
+            from dataclasses import replace as dc_replace
+            chat_form = dc_replace(parsed_form, fields=chat_fields)
+            state = collect_answers_with_llm(chat_form, validate_with_llm=True)
         except ValueError:
             st.error(
                 "Chat Mode requires a valid GOOGLE_API_KEY. "
@@ -232,8 +338,12 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
         user_message = st.chat_input("Type your response")
         if user_message:
             try:
+                # Get chat fields for processing
+                chat_fields = _prepare_fields_for_chat(parsed_form.fields)
+                from dataclasses import replace as dc_replace
+                chat_form = dc_replace(parsed_form, fields=chat_fields)
                 state = collect_answers_with_llm(
-                    parsed_form,
+                    chat_form,
                     existing_state=state,
                     user_input=user_message,
                     validate_with_llm=True,
@@ -256,8 +366,12 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
 
     if state.is_complete:
         st.success("All details collected. Review and continue below.")
-        st.session_state.answers = state.collected_answers
-        _stage_answers_for_confirmation(state.collected_answers)
+        # Expand chat answers to match all form fields (handle radio groups and checkboxes)
+        expanded_answers = _expand_chat_answers_to_form_fields(state.collected_answers, parsed_form.fields)
+        st.session_state.answers = expanded_answers
+        _stage_answers_for_confirmation(expanded_answers)
+        
+        # Display what was collected in chat
         for label, value in state.collected_answers.items():
             st.markdown(f"- **{label}**: {value}")
 

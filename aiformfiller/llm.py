@@ -271,10 +271,29 @@ def _generate_field_question(field: DetectedField, index: int, total: int) -> st
     Returns:
         A natural language question for the field.
     """
-    field_label = field.label.strip() or "this field"
     progress = f"({index + 1}/{total})"
-
-    # Ask directly so the user can request clarifications in follow-up chat.
+    
+    # Import FieldType here to avoid circular imports
+    try:
+        from .models import FieldType
+        
+        # Special handling for checkboxes - ask yes/no question
+        if hasattr(field, 'field_type') and field.field_type == FieldType.CHECKBOX:
+            field_label = field.label.strip() or "this option"
+            return f"{progress} Do you want to check '{field_label}'? (Yes/No)"
+        
+        # Special handling for radio buttons - ask for selection from group
+        if hasattr(field, 'field_type') and field.field_type == FieldType.RADIO:
+            # Use raw_label or group_key to get the base question
+            base_label = (field.raw_label or field.label).strip()
+            # Clean up the label (remove trailing colons, underscores)
+            base_label = base_label.replace("_", " ").strip(": ")
+            return f"{progress} What is your {base_label}? (e.g., {field.export_value or field.label})"
+    except ImportError:
+        pass
+    
+    # Default handling for text fields
+    field_label = field.label.strip() or "this field"
     return f"{progress} What value should I enter for '{field_label}'?"
 
 
