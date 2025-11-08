@@ -58,9 +58,9 @@ PDF Upload → Parse (PyMuPDF) → Field Extraction → User Input → Fill PDF 
    - Detects underline-based fields via pattern matching
    - Falls back to word-level geometry when span detection fails
 
-2. **Filler** (`aiformfiller/filler.py`)
-   - Inserts user-provided text at precise coordinates
-   - Positions text above underlines using bbox data
+2. **Filler** (`aiformfiller/filler.py` + `filler_pypdf.py`)
+   - First attempts native AcroForm field filling using `pypdf` (named form fields)
+   - Falls back to coordinate-based text insertion above underline spans when no native fields or library support
 
 3. **Pipeline** (`aiformfiller/pipeline.py`)
    - Orchestrates parsing and filling operations
@@ -108,6 +108,10 @@ See individual `GUIDELINES.md` files in each module for detailed best practices.
 
 ## 🐛 Troubleshooting
 
+**Fields not showing filled values in external viewers?**
+- Some PDFs require appearance regeneration. We set `/NeedAppearances` via `pypdf`; if still blank, open & resave in a PDF editor (forces appearance stream creation).
+- For radio/checkbox fields we rely on export values; ensure the original PDF has proper `/Opt` entries.
+
 **No fields detected?**
 - Ensure your PDF has text blocks with `___` or `...` patterns
 - Check that fields follow the format: `Label: ___________`
@@ -126,7 +130,7 @@ See individual `GUIDELINES.md` files in each module for detailed best practices.
 ## 📝 Future Enhancements
 
 - [ ] LLM-driven conversational field collection
-- [ ] Support for checkboxes and radio buttons
+- [x] Support for checkboxes and radio buttons (native AcroForm path)
 - [ ] OCR for scanned/image-based PDFs
 - [ ] Multi-page form navigation
 - [ ] Custom font selection

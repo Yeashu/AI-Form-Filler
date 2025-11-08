@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import logging
+import os
 import re
 from typing import BinaryIO, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
@@ -10,6 +12,19 @@ import fitz
 
 from .models import DetectedField, FieldType
 from .utils import assign_unique_labels
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    level_name = os.getenv("AIFORMFILLER_LOG", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.setLevel(level)
+    logger.addHandler(handler)
+else:
+    level_name = os.getenv("AIFORMFILLER_LOG", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
 
 _FIELD_REGEX = re.compile(r"([^:\n]+)\s*:\s*(?:_{3,}|\.{3,})")
 _UNDERLINE_MARKERS = ("___", "...", "____")
@@ -45,6 +60,13 @@ _BUTTON_KEYWORDS = (
 )
 _TEXTBOX_ALLOWED_CHARS = frozenset("_ .-‒–—=~·")
 WordTuple = Tuple[float, float, float, float, str, int, int, int]
+
+
+def _normalize_field_name(name: Optional[str]) -> Optional[str]:
+    if isinstance(name, str):
+        cleaned = name.strip()
+        return cleaned or None
+    return None
 
 
 def _prettify_label(text: str) -> str:
@@ -289,9 +311,26 @@ def _find_adjacent_label_text(
 
 
 def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
+    """Extract the export/option value for a widget.
+    
+    For radio/checkbox widgets, try to get the 'on' state name.
+    For text widgets, return current value if any.
+    """
+    # First, try the on_state() method for button widgets
+    try:
+        on_state = widget.on_state()
+        if on_state and isinstance(on_state, str):
+            stripped = on_state.strip()
+            if stripped and stripped.lower() not in {"off", "false"}:
+                return stripped
+    except Exception:
+        pass
+    
+    # Fallback to various value attributes
     candidates = (
         getattr(widget, "export_value", None),
         getattr(widget, "export", None),
+        getattr(widget, "button_caption", None),
         getattr(widget, "value", None),
         getattr(widget, "field_value", None),
         getattr(widget, "field_default", None),
@@ -299,23 +338,31 @@ def _extract_widget_option_value(widget: fitz.Widget) -> Optional[str]:
     for candidate in candidates:
         if isinstance(candidate, str):
             stripped = candidate.strip()
-            if stripped:
+            if stripped and stripped.lower() not in {"off", "false"}:
                 return stripped
     return None
 
 
 def _format_widget_label(widget: fitz.Widget, fallback_index: int) -> Tuple[str, str, Optional[str], Optional[str]]:
-    field_name = getattr(widget, "field_name", None)
-    base_label = getattr(widget, "field_label", None) or field_name or getattr(widget, "name", None)
-    if not isinstance(base_label, str) or not base_label.strip():
-        base_label = f"Field {fallback_index}"
-    base_label = base_label.strip()
+    canonical_name = _normalize_field_name(getattr(widget, "field_name", None))
+    if canonical_name is None:
+        canonical_name = _normalize_field_name(getattr(widget, "name", None))
+    if canonical_name is None:
+        canonical_name = _normalize_field_name(getattr(widget, "field_label", None))
+
+    base_label_source = getattr(widget, "field_label", None)
+    if not isinstance(base_label_source, str) or not base_label_source.strip():
+        base_label_source = canonical_name or f"Field {fallback_index}"
+    base_label = base_label_source.strip()
+
     option_value = _extract_widget_option_value(widget)
     if isinstance(option_value, str):
         normalized_value = option_value.strip()
         if normalized_value and normalized_value.lower() not in {"off", "false"}:
-            return f"{base_label} ({normalized_value})", base_label, normalized_value, field_name
-    return base_label, base_label, None, field_name
+            display_label = f"{base_label} ({normalized_value})"
+            return display_label, base_label, normalized_value, canonical_name
+
+    return base_label, base_label, None, canonical_name
 
 
 def _classify_marker_text(text: str) -> Optional[FieldType]:
@@ -441,6 +488,28 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
             pretty_base = _prettify_label(base_label)
             field_type = _map_widget_field_type(widget)
             bbox = (float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1))
+            
+            # For button types, extract the actual on-state value
+            button_state_value = None
+            if field_type in {FieldType.RADIO, FieldType.CHECKBOX}:
+                try:
+                    on_state = widget.on_state()
+                    logger.debug("Widget on_state() for '%s': %s (type: %s)", field_name or "unknown", on_state, type(on_state).__name__)
+                    if on_state and isinstance(on_state, str):
+                        button_state_value = on_state.strip()
+                    
+                    # Also check for button states list (radio buttons may have multiple options)
+                    try:
+                        button_states = widget.button_states()
+                        if button_states:
+                            logger.debug("Available button_states for '%s': %s", field_name or "unknown", button_states)
+                    except Exception:
+                        pass
+                        
+                except Exception as e:
+                    logger.debug("Failed to get on_state for '%s': %s", field_name or "unknown", e)
+                    pass
+            
             option_label = option_value
             display_label = initial_label
 
@@ -451,24 +520,43 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
                     display_label = f"{pretty_base} ({option_label})"
                 else:
                     display_label = pretty_base
+                # Use button state as export value, fallback to option_label
+                export_val = button_state_value or option_label
             elif field_type == FieldType.CHECKBOX:
-                if not option_label:
-                    option_label = _find_adjacent_label_text(words, bbox, side="right")
-                display_label = option_label or pretty_base
-                option_label = option_label or pretty_base
+                # For checkboxes, use adjacent text as display label, not the button state
+                adjacent_text = _find_adjacent_label_text(words, bbox, side="right")
+                if adjacent_text:
+                    display_label = adjacent_text
+                    option_label = adjacent_text
+                else:
+                    # Fallback to prettified base name
+                    display_label = pretty_base
+                    option_label = pretty_base
+                # Always use button state as export value for filling
+                export_val = button_state_value or "Yes"
             elif field_type in {FieldType.TEXT, FieldType.TEXTBOX}:
                 text_label = _find_adjacent_label_text(words, bbox, side="left")
                 if text_label:
                     display_label = text_label
                 else:
                     display_label = pretty_base
+                export_val = option_label
             else:
                 display_label = _prettify_label(initial_label)
+                export_val = option_label
 
-            raw_group_key = field_name if isinstance(field_name, str) else None
-            if raw_group_key:
-                raw_group_key = raw_group_key.strip() or None
+            raw_group_key = field_name
             group_key = raw_group_key if field_type == FieldType.RADIO else None
+            
+            logger.debug(
+                "Widget field: label='%s' type=%s name=%s export_value=%s button_state=%s",
+                display_label,
+                field_type,
+                field_name,
+                export_val,
+                button_state_value,
+            )
+            
             fields.append(
                 DetectedField(
                     page=page_index,
@@ -477,7 +565,7 @@ def _collect_widget_fields(doc: fitz.Document) -> List[DetectedField]:
                     raw_label=display_label,
                     field_type=field_type,
                     group_key=group_key,
-                    export_value=option_label,
+                    export_value=export_val,
                     form_field_name=raw_group_key,
                 )
             )
@@ -605,18 +693,16 @@ def _collect_block_fields(doc: fitz.Document) -> List[DetectedField]:
 def extract_fields(source: PdfSource) -> List[DetectedField]:
     doc = fitz.open(stream=source, filetype="pdf") if not isinstance(source, str) else fitz.open(source)
     try:
-        collected_fields: List[DetectedField] = []
         widget_fields = _collect_widget_fields(doc)
         if widget_fields:
-            collected_fields.extend(widget_fields)
+            return assign_unique_labels(widget_fields)
 
         span_fields = _collect_span_fields(doc)
         if span_fields:
-            collected_fields.extend(span_fields)
-        else:
-            collected_fields.extend(_collect_block_fields(doc))
+            return assign_unique_labels(span_fields)
 
-        return assign_unique_labels(collected_fields)
+        block_fields = _collect_block_fields(doc)
+        return assign_unique_labels(block_fields)
     finally:
         doc.close()
 
