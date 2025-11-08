@@ -177,8 +177,8 @@ def _render_text_field(field: DetectedField) -> str:
     default_value = st.session_state.answers.get(field.label, "")
     
     # Try to get auto-fill suggestion from storage
-    if not default_value and st.session_state.stored_data:
-        storage = SecureStorage()
+    storage = st.session_state.get("_secure_storage_instance")
+    if not default_value and st.session_state.stored_data and storage:
         suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
         if suggestion:
             default_value = suggestion
@@ -342,11 +342,12 @@ def _render_chat_interface(parsed_form: ParsedForm) -> None:
         # Pre-fill with stored data if available
         initial_answers = {}
         if st.session_state.stored_data:
-            storage = SecureStorage()
-            for field in chat_fields:
-                suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
-                if suggestion:
-                    initial_answers[field.label] = suggestion
+            storage = st.session_state.get("_secure_storage_instance")
+            if storage:
+                for field in chat_fields:
+                    suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
+                    if suggestion:
+                        initial_answers[field.label] = suggestion
         
         try:
             # Create a temporary ParsedForm with chat-friendly fields
@@ -467,13 +468,13 @@ def _render_confirmation(parsed_form: ParsedForm) -> None:
         # Save to storage if requested
         if st.session_state.save_to_storage and st.session_state.storage_password:
             try:
-                storage = SecureStorage()
+                storage = st.session_state.get("_secure_storage_instance")
                 # Filter out empty values and special symbols
                 data_to_save = {
                     k: v for k, v in answers.items() 
                     if v and v not in {_CHECKED_SYMBOL, _RADIO_SYMBOL, ""}
                 }
-                if data_to_save:
+                if data_to_save and storage:
                     storage.save_answers(data_to_save, st.session_state.storage_password)
                     # Reload stored data immediately so it's available for next form
                     st.session_state.stored_data = storage.load_answers(st.session_state.storage_password)
@@ -498,10 +499,14 @@ def main() -> None:
     st.set_page_config(page_title="AI Form Filler", page_icon="📝", layout="wide")
     _init_session_state()
 
+    # Create and cache SecureStorage instance in session state
+    if "_secure_storage_instance" not in st.session_state:
+        st.session_state["_secure_storage_instance"] = SecureStorage()
+    storage = st.session_state["_secure_storage_instance"]
+
     # Sidebar for storage settings
     with st.sidebar:
         st.header("🔒 Secure Storage")
-        storage = SecureStorage()
         
         # Check if data exists
         if storage.has_stored_data():

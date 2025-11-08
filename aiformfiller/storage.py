@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes
@@ -63,6 +63,7 @@ class SecureStorage:
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
+            # As of 2023, OWASP recommends at least 310,000 iterations for PBKDF2; using 480,000 for increased security margin.
             iterations=480000,
         )
         return kdf.derive(password.encode())
@@ -223,9 +224,9 @@ class SecureStorage:
             
             field_conflicts = field_words & conflict_words
             stored_conflicts = stored_words & conflict_words
-            
-            # If both have conflict words but they're different, heavily penalize
-            if field_conflicts and stored_conflicts and field_conflicts != stored_conflicts:
+            # If both have conflict words but none in common, heavily penalize
+            if field_conflicts and stored_conflicts and field_conflicts.isdisjoint(stored_conflicts):
+                base_score *= 0.2  # Very heavy penalty for mismatched person identifiers
                 base_score *= 0.2  # Very heavy penalty for mismatched person identifiers
             
             score = base_score

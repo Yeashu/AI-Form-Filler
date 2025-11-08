@@ -6,7 +6,7 @@ The AI Form Filler now includes **encrypted local storage** with fuzzy field mat
 
 ## Features
 
-✅ **AES-256 Encryption** - Data encrypted with Fernet (AES-128 CBC mode)  
+✅ **AES-128 Encryption** - Data encrypted with Fernet (AES-128 CBC mode)  
 ✅ **Password Protected** - Uses PBKDF2 key derivation with 480,000 iterations  
 ✅ **Fuzzy Matching** - Automatically matches similar field names (e.g., "Email" matches "Email Address")  
 ✅ **Local Only** - No cloud storage, all data stays on your machine  
