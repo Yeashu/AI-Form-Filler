@@ -506,17 +506,19 @@ def _radio_group_default_selection(group_fields: list) -> str:
 
 
 def _render_radio_group(group_key: str, group_fields: list) -> str:
-    """Render a radio button group."""
+    """Render a radio button group that works inside a form."""
     option_labels = [_radio_option_label(field) for field in group_fields]
     options = [_RADIO_NONE_OPTION] + option_labels
     default_label = _radio_group_default_selection(group_fields)
     default_index = options.index(default_label) if default_label in options else 0
     title = _format_group_title(group_fields[0])
+    # Use st.radio which works in forms - the key makes it unique
     return st.radio(
         title,
         options=options,
         index=default_index,
         key=f"radio_{group_key}",
+        horizontal=False,  # Vertical layout is clearer for forms
     )
 
 
@@ -534,8 +536,9 @@ def _radio_group_answers(group_fields: list, selection: str) -> Dict[str, str]:
 
 
 def _render_checkbox_field(field) -> str:
-    """Render a checkbox field."""
+    """Render a checkbox field that works inside a form."""
     default_checked = bool(st.session_state.answers.get(field.label))
+    # st.checkbox works fine in forms when given a unique key
     checked = st.checkbox(
         field.label,
         value=default_checked,
@@ -554,11 +557,12 @@ def _render_text_field(field) -> str:
         suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
         if suggestion:
             default_value = suggestion
+            logging.info(f"Auto-filled '{field.label}' with '{suggestion[:30]}...' from storage")
     
     if field.field_type == FieldType.TEXTBOX:
-        result = st.text_area(field.label, value=default_value)
+        result = st.text_area(field.label, value=default_value, key=f"text_{field.label}")
         return result if result is not None else ""
-    result = st.text_input(field.label, value=default_value)
+    result = st.text_input(field.label, value=default_value, key=f"text_{field.label}")
     return result if result is not None else ""
 
 
@@ -710,27 +714,37 @@ def main() -> None:
             help="Set a password to encrypt/decrypt your stored data"
         )
         
-        if password and password != st.session_state.storage_password:
-            st.session_state.storage_password = password
-            try:
-                storage = SecureStorage()
-                st.session_state._secure_storage_instance = storage
-                # Try to load existing data
+        # Initialize storage instance if password is provided
+        if password:
+            if password != st.session_state.storage_password or "_secure_storage_instance" not in st.session_state:
+                st.session_state.storage_password = password
                 try:
-                    loaded_data = storage.load_answers(password)
-                    st.session_state.stored_data = loaded_data
-                    st.success(f"✓ Loaded {len(loaded_data)} stored fields")
-                except StorageError:
-                    st.info("No previous data found or wrong password")
-                    st.session_state.stored_data = {}
-            except Exception as e:
-                st.error(f"Storage error: {str(e)}")
+                    storage = SecureStorage()
+                    st.session_state._secure_storage_instance = storage
+                    # Try to load existing data
+                    try:
+                        loaded_data = storage.load_answers(password)
+                        st.session_state.stored_data = loaded_data
+                        st.success(f"✓ Loaded {len(loaded_data)} stored fields")
+                    except StorageError:
+                        st.info("No previous data found or wrong password")
+                        st.session_state.stored_data = {}
+                except Exception as e:
+                    st.error(f"Storage error: {str(e)}")
         
         if st.session_state.stored_data:
             st.metric("Stored Fields", len(st.session_state.stored_data))
+            
+            # Show stored fields in expander
+            with st.expander("📋 View Stored Data"):
+                for key, value in sorted(st.session_state.stored_data.items()):
+                    st.text(f"{key}: {value[:50]}..." if len(value) > 50 else f"{key}: {value}")
+            
             if st.button("🗑️ Clear Storage"):
                 st.session_state.stored_data = {}
                 st.session_state.storage_password = None
+                if "_secure_storage_instance" in st.session_state:
+                    del st.session_state._secure_storage_instance
                 st.rerun()
 
     st.title("AI Form Filler MVP")
@@ -819,6 +833,11 @@ def main() -> None:
         # Render parser-based UI with proper field type support
         if st.session_state.input_mode == "form":
             st.subheader("Provide Field Values")
+            
+            # Debug info
+            if st.session_state.stored_data:
+                st.info(f"💡 Auto-fill available for {len(st.session_state.stored_data)} stored fields")
+            
             answers: Dict[str, str] = {}
             radio_groups = _group_radio_fields(parsed_form.fields)
             processed_radio_groups: Set[str] = set()
@@ -866,9 +885,17 @@ def main() -> None:
                             }
                             if data_to_save:
                                 storage.save_answers(data_to_save, st.session_state.storage_password)
+                                # Update session state to reflect saved data
+                                st.session_state.stored_data.update(data_to_save)
                                 st.success(f"💾 Saved {len(data_to_save)} responses to encrypted storage")
+                                logging.info(f"Saved fields to storage: {list(data_to_save.keys())}")
+                            else:
+                                st.info("No new data to save (empty or special values filtered out)")
                     except StorageError as e:
                         st.error(f"Failed to save to storage: {str(e)}")
+                    except Exception as e:
+                        st.error(f"Unexpected error saving to storage: {str(e)}")
+                        logging.error(f"Storage save error: {e}", exc_info=True)
                 
                 output_path = _build_output_path(st.session_state.uploaded_filename)
                 fill_parsed_form(parsed_form, answers, output_path.as_posix())
