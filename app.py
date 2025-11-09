@@ -569,6 +569,15 @@ def _render_text_field(field) -> str:
 def _render_field_inputs(extracted: FormExtractionResult) -> None:
     st.subheader("Provide Field Values")
     answers: Dict[str, str] = {}
+    
+    # Group radio fields by name (for HTML forms)
+    radio_groups_html: Dict[str, list] = {}
+    for field in extracted.fields:
+        if field.field_type == "radio":
+            radio_groups_html.setdefault(field.name, []).append(field)
+    
+    processed_radio_fields: Set[str] = set()
+    
     with st.form("field_input_form"):
         for index, field in enumerate(extracted.fields):
             label = field.label or field.name or "Field"
@@ -584,14 +593,67 @@ def _render_field_inputs(extracted: FormExtractionResult) -> None:
             layout = extracted.field_layouts.get(field.name or answer_key)
             widget_key = f"field_input_{index}_{field.name or 'unnamed'}"
 
-            if layout and (layout.kind == "grid" or layout.kind == "table"):
+            # Handle checkbox fields
+            if field.field_type == "checkbox":
+                default_checked = bool(default_value)
+                checked = st.checkbox(f"☑️ {label}", value=default_checked, key=widget_key)
+                answers[answer_key] = field.value if checked else ""
+            
+            # Handle radio button fields
+            elif field.field_type == "radio":
+                if field.name in processed_radio_fields:
+                    continue
+                processed_radio_fields.add(field.name)
+                
+                # Get all radio options for this group
+                radio_options = radio_groups_html.get(field.name, [field])
+                option_labels = [f.label or f.value for f in radio_options]
+                
+                # Find default selection
+                default_index = 0
+                for i, opt_field in enumerate(radio_options):
+                    opt_key = opt_field.name or opt_field.label
+                    if session_answers.get(opt_key):
+                        default_index = i
+                        break
+                
+                # Render radio group
+                group_label = field.name.replace("_", " ").title()
+                selected = st.radio(
+                    f"🔘 {group_label}",
+                    options=option_labels,
+                    index=default_index,
+                    key=widget_key,
+                    horizontal=True
+                )
+                
+                # Set answer for selected option
+                for opt_field in radio_options:
+                    opt_key = opt_field.name or opt_field.label
+                    opt_label = opt_field.label or opt_field.value
+                    answers[opt_key] = opt_field.value if opt_label == selected else ""
+            
+            # Handle select/dropdown fields
+            elif field.field_type == "select" and field.options:
+                default_index = 0
+                if default_value in field.options:
+                    default_index = field.options.index(default_value)
+                selected = st.selectbox(f"📋 {label}", options=field.options, index=default_index, key=widget_key)
+                answers[answer_key] = selected if selected else ""
+            
+            # Handle table/grid layouts
+            elif layout and (layout.kind == "grid" or layout.kind == "table"):
                 answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
+            
+            # Handle textarea
             elif field.field_type == "textarea":
                 answers[answer_key] = st.text_area(
                     label,
                     value=default_value,
                     key=widget_key,
                 )
+            
+            # Handle regular text inputs
             else:
                 answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
         
@@ -774,11 +836,36 @@ def main() -> None:
         metadata = extracted_form.metadata or {}
         has_interactive_fields = metadata.get("has_form_fields", False) and extracted_form.fields
         
+        # Check if HTML extraction found any radio or checkbox fields
+        has_radio_or_checkbox = any(
+            field.field_type in {"radio", "checkbox"} 
+            for field in extracted_form.fields
+        )
+        
         if has_interactive_fields:
-            # Use HTML-based pipeline for interactive PDFs
-            st.session_state.extracted_form = extracted_form
-            st.session_state.use_parser_mode = False
-            st.info("🎯 Detected interactive PDF form - using HTML-based extraction")
+            # If radio/checkbox detected, prefer parser mode for better handling
+            if has_radio_or_checkbox:
+                st.info("🔘 Detected radio/checkbox fields - switching to parser mode for better handling...")
+                try:
+                    parsed_form = parse_pdf(pdf_bytes)
+                    if parsed_form.fields:
+                        st.session_state.parsed_form = parsed_form
+                        st.session_state.use_parser_mode = True
+                        st.success("✓ Using parser-based extraction for radio/checkbox fields")
+                    else:
+                        # Parser found nothing, fall back to HTML
+                        st.warning("⚠️ Parser found no fields, using HTML extraction instead")
+                        st.session_state.extracted_form = extracted_form
+                        st.session_state.use_parser_mode = False
+                except Exception as e:
+                    st.warning(f"⚠️ Parser failed ({str(e)}), using HTML extraction instead")
+                    st.session_state.extracted_form = extracted_form
+                    st.session_state.use_parser_mode = False
+            else:
+                # Use HTML-based pipeline for interactive PDFs without radio/checkbox
+                st.session_state.extracted_form = extracted_form
+                st.session_state.use_parser_mode = False
+                st.info("🎯 Detected interactive PDF form - using HTML-based extraction")
         else:
             # Fallback to parser-based pipeline for underline-style PDFs
             st.warning("⚠️ No interactive form fields detected. Trying underline-based parser...")
@@ -905,6 +992,7 @@ def main() -> None:
                         st.caption(f"{field.label} (button field)")
                         answers[field.label] = ""
                     else:
+                        # Use the _render_text_field function which has auto-fill support
                         answers[field.label] = _render_text_field(field)
                 
                 # Add option to save to storage
