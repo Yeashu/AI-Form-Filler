@@ -7,7 +7,7 @@ import logging
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Set
 import tempfile
 import re
 import base64
@@ -41,6 +41,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 FORM_PIPELINE = FormPipeline()
 _TABLE_SPLIT_PATTERN = re.compile(r"\t|,|\s{2,}")
+_RADIO_NONE_OPTION = "— No selection —"
+_CHECKED_SYMBOL = "X"
+_RADIO_SYMBOL = "●"
 
 
 def _persist_pdf(bytes_data: bytes, original_name: str) -> str:
@@ -466,6 +469,99 @@ def _finalise_pdf(extracted: FormExtractionResult, answers: Dict[str, str]) -> N
     st.success("PDF filled successfully. Download below.")
 
 
+def _group_radio_fields(fields: list) -> Dict[str, list]:
+    """Group radio button fields by their group key."""
+    from collections import defaultdict
+    groups: Dict[str, list] = defaultdict(list)
+    for field in fields:
+        if field.field_type != FieldType.RADIO:
+            continue
+        group_key = field.group_key or field.raw_label or field.label
+        groups[group_key].append(field)
+    return groups
+
+
+def _format_group_title(field) -> str:
+    """Format a radio group title from field metadata."""
+    source = field.group_key or field.raw_label or field.label
+    cleaned = (source or "").replace("_", " ").strip().strip(":")
+    if not cleaned:
+        return "Selection"
+    return cleaned[0].upper() + cleaned[1:]
+
+
+def _radio_option_label(field) -> str:
+    """Get display label for a radio option."""
+    if field.export_value and field.export_value.lower() not in {"off", "false"}:
+        return field.export_value
+    return field.label
+
+
+def _radio_group_default_selection(group_fields: list) -> str:
+    """Get the default selection for a radio group."""
+    for field in group_fields:
+        if st.session_state.answers.get(field.label):
+            return _radio_option_label(field)
+    return _RADIO_NONE_OPTION
+
+
+def _render_radio_group(group_key: str, group_fields: list) -> str:
+    """Render a radio button group."""
+    option_labels = [_radio_option_label(field) for field in group_fields]
+    options = [_RADIO_NONE_OPTION] + option_labels
+    default_label = _radio_group_default_selection(group_fields)
+    default_index = options.index(default_label) if default_label in options else 0
+    title = _format_group_title(group_fields[0])
+    return st.radio(
+        title,
+        options=options,
+        index=default_index,
+        key=f"radio_{group_key}",
+    )
+
+
+def _radio_group_answers(group_fields: list, selection: str) -> Dict[str, str]:
+    """Convert radio selection to answer dictionary."""
+    answers: Dict[str, str] = {}
+    if selection == _RADIO_NONE_OPTION:
+        for field in group_fields:
+            answers[field.label] = ""
+        return answers
+    for field in group_fields:
+        option_label = _radio_option_label(field)
+        answers[field.label] = _RADIO_SYMBOL if option_label == selection else ""
+    return answers
+
+
+def _render_checkbox_field(field) -> str:
+    """Render a checkbox field."""
+    default_checked = bool(st.session_state.answers.get(field.label))
+    checked = st.checkbox(
+        field.label,
+        value=default_checked,
+        key=f"checkbox_{field.label}",
+    )
+    return _CHECKED_SYMBOL if checked else ""
+
+
+def _render_text_field(field) -> str:
+    """Render a text input field with auto-fill from storage."""
+    default_value = st.session_state.answers.get(field.label, "")
+    
+    # Try to get auto-fill suggestion from storage
+    storage = st.session_state.get("_secure_storage_instance")
+    if not default_value and st.session_state.stored_data and storage:
+        suggestion = storage.get_suggestion(field.label, st.session_state.stored_data)
+        if suggestion:
+            default_value = suggestion
+    
+    if field.field_type == FieldType.TEXTBOX:
+        result = st.text_area(field.label, value=default_value)
+        return result if result is not None else ""
+    result = st.text_input(field.label, value=default_value)
+    return result if result is not None else ""
+
+
 def _render_field_inputs(extracted: FormExtractionResult) -> None:
     st.subheader("Provide Field Values")
     answers: Dict[str, str] = {}
@@ -602,6 +698,41 @@ def main() -> None:
     st.set_page_config(page_title="AI Form Filler", page_icon="📝", layout="wide")
     _init_session_state()
 
+    # Sidebar for storage setup
+    with st.sidebar:
+        st.header("🔐 Secure Storage")
+        st.markdown("Encrypt and save form responses for future use.")
+        
+        password = st.text_input(
+            "Storage Password",
+            type="password",
+            value=st.session_state.storage_password or "",
+            help="Set a password to encrypt/decrypt your stored data"
+        )
+        
+        if password and password != st.session_state.storage_password:
+            st.session_state.storage_password = password
+            try:
+                storage = SecureStorage()
+                st.session_state._secure_storage_instance = storage
+                # Try to load existing data
+                try:
+                    loaded_data = storage.load_answers(password)
+                    st.session_state.stored_data = loaded_data
+                    st.success(f"✓ Loaded {len(loaded_data)} stored fields")
+                except StorageError:
+                    st.info("No previous data found or wrong password")
+                    st.session_state.stored_data = {}
+            except Exception as e:
+                st.error(f"Storage error: {str(e)}")
+        
+        if st.session_state.stored_data:
+            st.metric("Stored Fields", len(st.session_state.stored_data))
+            if st.button("🗑️ Clear Storage"):
+                st.session_state.stored_data = {}
+                st.session_state.storage_password = None
+                st.rerun()
+
     st.title("AI Form Filler MVP")
     st.write(
         "Upload a clean digital PDF form. We'll convert it to HTML, detect the fields, ask "
@@ -685,20 +816,60 @@ def main() -> None:
             st.session_state.input_mode = new_mode
             st.session_state.conversation_state = None
         
-        # Render parser-based UI (simplified version for now)
+        # Render parser-based UI with proper field type support
         if st.session_state.input_mode == "form":
             st.subheader("Provide Field Values")
             answers: Dict[str, str] = {}
+            radio_groups = _group_radio_fields(parsed_form.fields)
+            processed_radio_groups: Set[str] = set()
+            
             with st.form("parser_field_input_form"):
                 for field in parsed_form.fields:
-                    default_value = st.session_state.answers.get(field.label, "")
-                    user_input = st.text_input(field.label, value=default_value)
-                    answers[field.label] = user_input if user_input else ""
+                    if field.field_type == FieldType.RADIO:
+                        group_key = field.group_key or field.raw_label or field.label
+                        if group_key in processed_radio_groups:
+                            continue
+                        group_fields = radio_groups.get(group_key, [field])
+                        selection = _render_radio_group(group_key, group_fields)
+                        answers.update(_radio_group_answers(group_fields, selection))
+                        processed_radio_groups.add(group_key)
+                    elif field.field_type == FieldType.CHECKBOX:
+                        answers[field.label] = _render_checkbox_field(field)
+                    elif field.field_type == FieldType.BUTTON:
+                        st.caption(f"{field.label} (button field)")
+                        answers[field.label] = ""
+                    else:
+                        answers[field.label] = _render_text_field(field)
+                
+                # Add option to save to storage
+                if st.session_state.storage_password:
+                    st.session_state.save_to_storage = st.checkbox(
+                        "💾 Save responses to encrypted storage for future use",
+                        value=st.session_state.save_to_storage,
+                        help="Your data will be encrypted and stored locally"
+                    )
                 
                 submitted = st.form_submit_button("Fill PDF")
             
             if submitted:
                 st.session_state.answers = answers
+                
+                # Save to storage if requested
+                if st.session_state.save_to_storage and st.session_state.storage_password:
+                    try:
+                        storage = st.session_state.get("_secure_storage_instance")
+                        if storage:
+                            # Filter out empty values and special symbols
+                            data_to_save = {
+                                k: v for k, v in answers.items() 
+                                if v and v not in {_CHECKED_SYMBOL, _RADIO_SYMBOL, ""}
+                            }
+                            if data_to_save:
+                                storage.save_answers(data_to_save, st.session_state.storage_password)
+                                st.success(f"💾 Saved {len(data_to_save)} responses to encrypted storage")
+                    except StorageError as e:
+                        st.error(f"Failed to save to storage: {str(e)}")
+                
                 output_path = _build_output_path(st.session_state.uploaded_filename)
                 fill_parsed_form(parsed_form, answers, output_path.as_posix())
                 with output_path.open("rb") as fp:
