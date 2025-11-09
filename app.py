@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Sequence
 import tempfile
+import re
+import base64
+import streamlit.components.v1 as components
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -18,7 +22,7 @@ from aiformfiller.llm import (
     get_next_question,
     process_user_response,
 )
-from services import FormPipeline, FormExtractionResult
+from services import FormPipeline, FormExtractionResult, FieldLayout
 
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -28,6 +32,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 FORM_PIPELINE = FormPipeline()
+_TABLE_SPLIT_PATTERN = re.compile(r"\t|,|\s{2,}")
 
 
 def _persist_pdf(bytes_data: bytes, original_name: str) -> str:
@@ -83,6 +88,8 @@ def _init_session_state() -> None:
         "pending_answers": {},
         "awaiting_confirmation": False,
         "filled_html": None,
+        "preview_pdf_bytes": None,
+        "preview_pdf_name": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -100,6 +107,8 @@ def _reset_state_on_new_upload(filename: str) -> None:
         st.session_state.pending_answers = {}
         st.session_state.awaiting_confirmation = False
         st.session_state.filled_html = None
+        st.session_state.preview_pdf_bytes = None
+        st.session_state.preview_pdf_name = None
         st.session_state.uploaded_filename = filename
 
 
@@ -107,6 +116,275 @@ def _build_output_path(upload_name: str | None) -> Path:
     stem = Path(upload_name or "filled_form").stem
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return OUTPUT_DIR / f"{stem}_filled_{timestamp}.pdf"
+
+
+def _parse_table_string(raw: str) -> list[list[str]]:
+    lines = str(raw or "").splitlines()
+    return [
+        [cell.strip() for cell in _TABLE_SPLIT_PATTERN.split(line)] if line else [""]
+        for line in lines
+    ]
+
+
+def _prepare_table_rows(value: str, layout: FieldLayout) -> tuple[list[list[str]], int, int]:
+    parsed = _parse_table_string(value)
+    rows = layout.rows or len(parsed) or 1
+    cols = layout.columns or max((len(row) for row in parsed), default=0)
+    if cols <= 0:
+        cols = 1
+    normalised: list[list[str]] = []
+    for row_index in range(rows):
+        source = parsed[row_index] if row_index < len(parsed) else []
+        trimmed = source[:cols]
+        if len(trimmed) < cols:
+            trimmed = trimmed + [""] * (cols - len(trimmed))
+        normalised.append(trimmed)
+    return normalised, rows, cols
+
+
+def _serialise_table_rows(rows: list[list[str]]) -> str:
+    if not rows:
+        return ""
+    lines = ["\t".join(cell.strip() for cell in row) for row in rows]
+    if all(not line for line in lines):
+        return ""
+    return "\n".join(lines).rstrip()
+
+
+def _generate_preview_pdf(extracted: FormExtractionResult, answers: Dict[str, str]) -> None:
+    if not answers:
+        st.warning("No answers available to preview the form.")
+        return
+
+    name_mapped_answers = _map_answers_to_field_names(extracted, answers)
+    if not name_mapped_answers:
+        st.warning("No answers matched the detected form fields.")
+        return
+
+    # Debug: Show what we're filling
+    st.info(f"Generating preview with {len(name_mapped_answers)} field values...")
+    with st.expander("🔍 Debug: Field Mapping (Click to expand)"):
+        st.markdown("**Fields we're trying to fill:**")
+        for key, value in sorted(name_mapped_answers.items()):
+            st.text(f"  {key}: {value[:50] if len(value) > 50 else value}")
+        
+        st.markdown("**All detected form fields:**")
+        for field in extracted.fields:
+            st.text(f"  Name: {field.name or 'N/A'} | Label: {field.label or 'N/A'}")
+
+    temp_dir = OUTPUT_DIR / "tmp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf", dir=temp_dir) as tmp_file:
+        preview_path = tmp_file.name
+
+    pdf_path: str | None = None
+    try:
+        _, pdf_path = FORM_PIPELINE.fill(extracted, name_mapped_answers, preview_path)
+        if pdf_path and Path(pdf_path).exists():
+            with Path(pdf_path).open("rb") as fp:
+                st.session_state.preview_pdf_bytes = fp.read()
+            st.session_state.preview_pdf_name = Path(pdf_path).name
+            logging.info(f"Preview PDF generated: {pdf_path}, size: {len(st.session_state.preview_pdf_bytes)} bytes")
+            st.success(f"✓ Preview generated successfully ({len(st.session_state.preview_pdf_bytes):,} bytes)")
+        else:
+            st.error(f"Failed to generate preview PDF at {pdf_path}")
+            logging.error(f"Preview PDF not found at {pdf_path}")
+    except Exception as e:
+        st.error(f"Error generating preview: {str(e)}")
+        logging.error(f"Error in _generate_preview_pdf: {e}", exc_info=True)
+    finally:
+        for path_str in (preview_path, pdf_path):
+            if not path_str:
+                continue
+            try:
+                Path(path_str).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _render_pdf_preview() -> None:
+    preview_bytes = st.session_state.get("preview_pdf_bytes")
+    if not preview_bytes:
+        return
+
+    st.subheader("PDF Preview")
+    st.caption(f"Showing filled PDF preview ({len(preview_bytes):,} bytes)")
+    try:
+        encoded = base64.b64encode(preview_bytes).decode("utf-8")
+    except Exception:  # pragma: no cover
+        st.error("Unable to display preview.")
+        return
+
+    safe_payload = json.dumps(encoded)
+    preview_html = f"""
+<div style="width:100%; background-color:#1e1e1e; padding:12px; border-radius:8px;">
+    <div style="text-align:center; margin-bottom:10px;">
+        <button id="prev-page" style="padding:8px 16px; margin:0 5px; background:#4a4a4a; color:white; border:none; border-radius:4px; cursor:pointer;">← Previous</button>
+        <span id="page-info" style="color:#cccccc; margin:0 10px;">Page 1 of ?</span>
+        <button id="next-page" style="padding:8px 16px; margin:0 5px; background:#4a4a4a; color:white; border:none; border-radius:4px; cursor:pointer;">Next →</button>
+    </div>
+    <div style="max-height:800px; overflow-y:auto; background:#2b2b2b; padding:10px; border-radius:4px;">
+        <canvas id="pdf-preview-canvas" style="width:100%; max-width:900px; display:block; margin:0 auto;"></canvas>
+    </div>
+    <div id="pdf-preview-message" style="text-align:center; color:#cccccc; margin-top:8px;">Loading preview...</div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+    <script>
+        (function() {{
+            const base64 = {safe_payload};
+            let pdfDoc = null;
+            let currentPage = 1;
+            let rendering = false;
+
+            function toUint8Array(b64) {{
+                try {{
+                    const binary = atob(b64);
+                    const length = binary.length;
+                    const bytes = new Uint8Array(length);
+                    for (let index = 0; index < length; index += 1) {{
+                        bytes[index] = binary.charCodeAt(index);
+                    }}
+                    return bytes;
+                }} catch (error) {{
+                    console.error('Error converting base64:', error);
+                    throw error;
+                }}
+            }}
+
+            function renderPage(pageNum) {{
+                if (rendering || !pdfDoc) return;
+                rendering = true;
+
+                const canvas = document.getElementById('pdf-preview-canvas');
+                const message = document.getElementById('pdf-preview-message');
+                const pageInfo = document.getElementById('page-info');
+
+                message.innerText = 'Rendering page ' + pageNum + '...';
+
+                pdfDoc.getPage(pageNum)
+                    .then(function(page) {{
+                        const containerWidth = canvas.parentElement.clientWidth || 600;
+                        const viewport = page.getViewport({{ scale: 1 }});
+                        const scale = Math.min((containerWidth - 20) / viewport.width, 2.0);
+                        const scaledViewport = page.getViewport({{ scale: scale }});
+
+                        canvas.height = scaledViewport.height;
+                        canvas.width = scaledViewport.width;
+
+                        const renderContext = {{
+                            canvasContext: canvas.getContext('2d'),
+                            viewport: scaledViewport,
+                        }};
+
+                        return page.render(renderContext).promise;
+                    }})
+                    .then(function() {{
+                        rendering = false;
+                        message.innerText = '';
+                        pageInfo.innerText = 'Page ' + pageNum + ' of ' + pdfDoc.numPages;
+                        updateButtons();
+                        // Scroll to top of canvas
+                        canvas.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                    }})
+                    .catch(function(error) {{
+                        rendering = false;
+                        console.error('Error rendering page:', error);
+                        message.innerText = 'Error: ' + error.message;
+                        message.style.color = '#ff6b6b';
+                    }});
+            }}
+
+            function updateButtons() {{
+                const prevBtn = document.getElementById('prev-page');
+                const nextBtn = document.getElementById('next-page');
+
+                if (prevBtn && nextBtn && pdfDoc) {{
+                    prevBtn.disabled = currentPage <= 1;
+                    nextBtn.disabled = currentPage >= pdfDoc.numPages;
+                    prevBtn.style.opacity = currentPage <= 1 ? '0.5' : '1';
+                    nextBtn.style.opacity = currentPage >= pdfDoc.numPages ? '0.5' : '1';
+                    prevBtn.style.cursor = currentPage <= 1 ? 'not-allowed' : 'pointer';
+                    nextBtn.style.cursor = currentPage >= pdfDoc.numPages ? 'not-allowed' : 'pointer';
+                }}
+            }}
+
+            function startRender() {{
+                const canvas = document.getElementById('pdf-preview-canvas');
+                const message = document.getElementById('pdf-preview-message');
+                const prevBtn = document.getElementById('prev-page');
+                const nextBtn = document.getElementById('next-page');
+
+                if (!canvas || !message || typeof window.pdfjsLib === 'undefined') {{
+                    return false;
+                }}
+
+                try {{
+                    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                }} catch (workerError) {{
+                    console.warn('Worker configuration warning:', workerError);
+                }}
+
+                try {{
+                    const pdfData = toUint8Array(base64);
+                    const loadingTask = pdfjsLib.getDocument({{ data: pdfData }});
+
+                    loadingTask.promise
+                        .then(function(pdf) {{
+                            pdfDoc = pdf;
+                            console.log('PDF loaded, pages:', pdf.numPages);
+
+                            // Set up navigation buttons
+                            prevBtn.onclick = function() {{
+                                if (currentPage > 1 && !rendering) {{
+                                    currentPage--;
+                                    renderPage(currentPage);
+                                }}
+                            }};
+
+                            nextBtn.onclick = function() {{
+                                if (currentPage < pdfDoc.numPages && !rendering) {{
+                                    currentPage++;
+                                    renderPage(currentPage);
+                                }}
+                            }};
+
+                            // Render first page
+                            renderPage(1);
+                        }})
+                        .catch(function(error) {{
+                            console.error('Error loading PDF:', error);
+                            message.innerText = 'Error loading PDF: ' + error.message;
+                            message.style.color = '#ff6b6b';
+                        }});
+
+                    return true;
+                }} catch (error) {{
+                    console.error('Error in startRender:', error);
+                    message.innerText = 'Error: ' + error.message;
+                    message.style.color = '#ff6b6b';
+                    return false;
+                }}
+            }}
+
+            function tryRender() {{
+                if (startRender()) {{
+                    return;
+                }}
+                setTimeout(tryRender, 100);
+            }}
+
+            if (document.readyState === 'complete') {{
+                setTimeout(tryRender, 100);
+            }} else {{
+                window.addEventListener('load', function() {{
+                    setTimeout(tryRender, 100);
+                }});
+            }}
+        }})();
+    </script>
+</div>
+"""
+    components.html(preview_html, height=900, scrolling=True)
 
 
 def _normalise_answers(fields: Sequence, raw_answers: Dict[str, str]) -> Dict[str, str]:
@@ -151,6 +429,8 @@ def _stage_answers_for_confirmation(fields: Sequence, answers: Dict[str, str]) -
     st.session_state.answers = normalised.copy()
     st.session_state.filled_pdf_bytes = None
     st.session_state.filled_pdf_name = None
+    st.session_state.preview_pdf_bytes = None
+    st.session_state.preview_pdf_name = None
 
 
 def _finalise_pdf(extracted: FormExtractionResult, answers: Dict[str, str]) -> None:
@@ -191,28 +471,8 @@ def _render_field_inputs(extracted: FormExtractionResult) -> None:
             layout = extracted.field_layouts.get(field.name or answer_key)
             widget_key = f"field_input_{index}_{field.name or 'unnamed'}"
 
-            if layout and layout.kind == "grid":
-                max_chars = layout.columns if layout.columns > 0 else None
-                help_text = "Characters will be distributed across the boxes."
-                if layout.columns:
-                    help_text = f"Enter up to {layout.columns} characters; blanks will clear remaining boxes."
-                text_kwargs = {
-                    "label": label,
-                    "value": default_value,
-                    "key": widget_key,
-                    "help": help_text,
-                }
-                if max_chars is not None:
-                    text_kwargs["max_chars"] = max_chars
-                answers[answer_key] = st.text_input(**text_kwargs)
-            elif layout and layout.kind == "table":
-                answers[answer_key] = st.text_area(
-                    label,
-                    value=default_value,
-                    key=widget_key,
-                    height=140,
-                    help="Use commas or tabs to separate columns and new lines for rows.",
-                )
+            if layout and (layout.kind == "grid" or layout.kind == "table"):
+                answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
             elif field.field_type == "textarea":
                 answers[answer_key] = st.text_area(
                     label,
@@ -221,10 +481,20 @@ def _render_field_inputs(extracted: FormExtractionResult) -> None:
                 )
             else:
                 answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
-        submitted = st.form_submit_button("Review Answers")
-    if submitted:
+        
+        col1, col2 = st.columns(2)
+        preview_btn = col1.form_submit_button("Preview Filled PDF", type="secondary")
+        confirm_btn = col2.form_submit_button("Confirm & Fill PDF", type="primary")
+    
+    if preview_btn:
         _stage_answers_for_confirmation(extracted.fields, answers)
+        _generate_preview_pdf(extracted, answers)
         st.rerun()
+    elif confirm_btn:
+        _stage_answers_for_confirmation(extracted.fields, answers)
+        _finalise_pdf(extracted, answers)
+        st.rerun()
+    
     return None
 
 
@@ -287,53 +557,8 @@ def _render_chat_interface(extracted: FormExtractionResult) -> None:
 
 
 def _render_confirmation(extracted: FormExtractionResult) -> None:
-    if not st.session_state.awaiting_confirmation:
-        return
-
-    answers = st.session_state.pending_answers or {}
-    if not answers:
-        st.session_state.awaiting_confirmation = False
-        return
-
-    st.subheader("Review Your Answers")
-    for field in extracted.fields:
-        label = field.label or field.name or "Field"
-        value = answers.get(field.name) or answers.get(label, "")
-        display_value = value if value else "_Not provided_"
-        layout = extracted.field_layouts.get(field.name or label)
-        if layout and layout.kind == "table":
-            st.markdown(f"**{label}**")
-            if value:
-                st.text(value)
-            else:
-                st.markdown("_Not provided_")
-            continue
-
-        st.markdown(f"- **{label}**: {display_value}")
-
-    col_confirm, col_edit = st.columns(2)
-    confirm_clicked = col_confirm.button(
-        "Confirm & Fill PDF",
-        type="primary",
-        key="confirm_fill_pdf",
-    )
-    edit_clicked = col_edit.button(
-        "Edit Answers",
-        key="edit_answers_button",
-    )
-
-    if confirm_clicked:
-        _finalise_pdf(extracted, answers)
-        return
-
-    if edit_clicked:
-        st.session_state.awaiting_confirmation = False
-        st.session_state.pending_answers = answers.copy()
-        st.session_state.filled_pdf_bytes = None
-        st.session_state.filled_pdf_name = None
-        st.session_state.input_mode = "form"
-        st.session_state.conversation_state = None
-        st.rerun()
+    # This function is no longer needed as buttons are now in the form
+    pass
 
 
 def main() -> None:
@@ -390,6 +615,7 @@ def main() -> None:
 
     st.subheader("Detected Fields")
     layouts = extracted_form.field_layouts
+    positions = extracted_form.field_positions
     st.dataframe(
         {
             "Label": [field.label or "" for field in extracted_form.fields],
@@ -397,6 +623,10 @@ def main() -> None:
             "Type": [field.field_type for field in extracted_form.fields],
             "Required": ["Yes" if field.required else "No" for field in extracted_form.fields],
             "Placeholder": [field.placeholder or "" for field in extracted_form.fields],
+            "Page": [
+                int(positions.get(field.name, (0, 0.0, 0.0))[0]) + 1
+                for field in extracted_form.fields
+            ],
             "Layout": [
                 (layouts[field.name].kind if field.name in layouts else "single")
                 for field in extracted_form.fields
@@ -425,6 +655,7 @@ def main() -> None:
         _render_field_inputs(extracted_form)
 
     _render_confirmation(extracted_form)
+    _render_pdf_preview()
 
     if st.session_state.filled_pdf_bytes and not st.session_state.awaiting_confirmation:
         st.download_button(

@@ -53,7 +53,9 @@ class GroupedField:
 class HTMLExtractor:
     """Convert interactive PDFs into HTML form markup and collect basic metadata."""
 
-    def pdf_to_html(self, pdf_path: str) -> Tuple[str, Dict[str, List[str]], Dict[str, FieldLayout]]:
+    def pdf_to_html(
+        self, pdf_path: str
+    ) -> Tuple[str, Dict[str, List[str]], Dict[str, FieldLayout], Dict[str, Tuple[int, float, float]]]:
         """Render the supplied PDF as a basic HTML form and return mapping metadata."""
 
         path = Path(pdf_path)
@@ -74,13 +76,14 @@ class HTMLExtractor:
                 "[HTMLExtractor] No interactive widgets detected in '%s'. Falling back to text-only HTML.",
                 path.name,
             )
-            return self._build_text_fallback(path), {}, {}
+            return self._build_text_fallback(path), {}, {}, {}
 
         grouped_fields = self._group_fields(fields)
         html = self._render_grouped_fields(grouped_fields)
         field_mappings = {group.html_name: group.widget_names for group in grouped_fields}
         field_layouts = {group.html_name: group.layout for group in grouped_fields}
-        return html, field_mappings, field_layouts
+        field_positions = {group.html_name: group.order for group in grouped_fields}
+        return html, field_mappings, field_layouts, field_positions
 
     def extract_pdf_metadata(self, pdf_path: str) -> Dict[str, Any]:
         """Extract high-level metadata about the PDF form."""

@@ -34,18 +34,37 @@ class PDFFiller:
         return str(destination)
 
     def _apply_answers(self, document: fitz.Document, answers: Dict[str, str]) -> None:
-        for page in document:
-            widgets = page.widgets() or []
+        import logging
+        filled_count = 0
+        skipped_count = 0
+        all_widget_names = []
+        
+        for page_num, page in enumerate(document):
+            widgets = list(page.widgets() or [])
+            logging.info(f"Page {page_num + 1}: Found {len(widgets)} widgets")
+            
             for widget in widgets:
                 name = widget.field_name or widget.field_label
+                label = widget.field_label
+                if name:
+                    all_widget_names.append(f"{name} (label: {label})" if label != name else name)
+                
                 if not name:
+                    skipped_count += 1
                     continue
 
                 value = self._resolve_answer(name, widget.field_label, answers)
                 if value is None:
+                    logging.debug(f"No value found for field: {name} (label: {label})")
+                    skipped_count += 1
                     continue
 
+                logging.info(f"Filling field '{name}' with value: {value[:50]}")
                 self._set_widget_value(widget, value)
+                filled_count += 1
+        
+        logging.info(f"Filled {filled_count} fields, skipped {skipped_count} fields")
+        logging.info(f"All PDF widget names: {', '.join(all_widget_names[:10])}{'...' if len(all_widget_names) > 10 else ''}")
 
     def _resolve_answer(
         self,

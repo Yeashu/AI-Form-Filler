@@ -23,6 +23,7 @@ class FormExtractionResult:
     pdf_path: str
     field_mappings: Dict[str, list[str]]
     field_layouts: Dict[str, FieldLayout]
+    field_positions: Dict[str, Tuple[int, float, float]]
 
 
 class FormPipeline:
@@ -37,7 +38,7 @@ class FormPipeline:
     def extract(self, pdf_path: str) -> FormExtractionResult:
         """Convert a PDF into HTML and recover structured form fields and metadata."""
 
-        html, field_mappings, field_layouts = self._extractor.pdf_to_html(pdf_path)
+        html, field_mappings, field_layouts, field_positions = self._extractor.pdf_to_html(pdf_path)
         metadata = self._extractor.extract_pdf_metadata(pdf_path)
         fields = self._detector.extract_fields(html)
         return FormExtractionResult(
@@ -47,6 +48,7 @@ class FormPipeline:
             pdf_path=pdf_path,
             field_mappings=field_mappings,
             field_layouts=field_layouts,
+            field_positions=field_positions,
         )
 
     def initialise_conversation(self, extracted: FormExtractionResult) -> ConversationState:
