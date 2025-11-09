@@ -807,6 +807,41 @@ def main() -> None:
         st.caption(f"📄 Underline-based PDF detected")
         
         st.subheader("Detected Fields")
+        
+        # Debug: Show field type distribution
+        field_type_counts = {}
+        for field in parsed_form.fields:
+            ftype = field.field_type.value if hasattr(field.field_type, 'value') else str(field.field_type)
+            field_type_counts[ftype] = field_type_counts.get(ftype, 0) + 1
+        
+        # Highlight if we have radio or checkbox fields
+        has_radio = field_type_counts.get('radio', 0) > 0
+        has_checkbox = field_type_counts.get('checkbox', 0) > 0
+        
+        if has_radio or has_checkbox:
+            st.success(f"✓ Found interactive field types: {field_type_counts}")
+        else:
+            st.info(f"📝 Field types detected: {field_type_counts}")
+            with st.expander("⚠️ No radio or checkbox fields detected - Click to see what the parser looks for"):
+                st.markdown("""
+                The parser detects checkbox and radio buttons based on specific patterns in the PDF text:
+                
+                **Checkboxes** are detected when the PDF contains:
+                - Square brackets with optional marks: `[ ]`, `[x]`, `[X]`, `[✓]`, `[✔]`
+                - Unicode checkbox glyphs: ☐, ☑, ☒, ■, □, ▢, ⬜
+                
+                **Radio buttons** are detected when the PDF contains:
+                - Parentheses with optional marks: `( )`, `(x)`, `(o)`, `(O)`, `(•)`, `(●)`
+                - Unicode radio glyphs: ○, ◯, ⚪, ⚫, ●, ◉, ◎
+                
+                **Text fields** are detected by:
+                - Underlines: `___` or `...` (3 or more)
+                - Labels followed by underlines/dots
+                
+                If your PDF doesn't contain these patterns, only text fields will be detected.
+                """)
+                st.info("💡 **Tip**: For interactive PDFs with form widgets (like the one you uploaded), use the HTML-based pipeline instead - it handles radio buttons and checkboxes natively!")
+        
         st.dataframe(
             {
                 "Field": [field.label for field in parsed_form.fields],
@@ -838,9 +873,19 @@ def main() -> None:
             if st.session_state.stored_data:
                 st.info(f"💡 Auto-fill available for {len(st.session_state.stored_data)} stored fields")
             
+            # Debug: Show field type breakdown
+            radio_count = sum(1 for f in parsed_form.fields if f.field_type == FieldType.RADIO)
+            checkbox_count = sum(1 for f in parsed_form.fields if f.field_type == FieldType.CHECKBOX)
+            text_count = sum(1 for f in parsed_form.fields if f.field_type in (FieldType.TEXT, FieldType.TEXTBOX))
+            st.caption(f"🔍 Field breakdown: {radio_count} radio, {checkbox_count} checkbox, {text_count} text")
+            
             answers: Dict[str, str] = {}
             radio_groups = _group_radio_fields(parsed_form.fields)
             processed_radio_groups: Set[str] = set()
+            
+            # Debug: Show radio groups
+            if radio_groups:
+                st.caption(f"📻 Radio groups found: {list(radio_groups.keys())}")
             
             with st.form("parser_field_input_form"):
                 for field in parsed_form.fields:
@@ -849,10 +894,12 @@ def main() -> None:
                         if group_key in processed_radio_groups:
                             continue
                         group_fields = radio_groups.get(group_key, [field])
+                        st.write(f"🔘 Rendering radio group: {group_key} ({len(group_fields)} options)")
                         selection = _render_radio_group(group_key, group_fields)
                         answers.update(_radio_group_answers(group_fields, selection))
                         processed_radio_groups.add(group_key)
                     elif field.field_type == FieldType.CHECKBOX:
+                        st.write(f"☑️ Rendering checkbox: {field.label}")
                         answers[field.label] = _render_checkbox_field(field)
                     elif field.field_type == FieldType.BUTTON:
                         st.caption(f"{field.label} (button field)")
