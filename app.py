@@ -22,6 +22,14 @@ from aiformfiller.llm import (
     get_next_question,
     process_user_response,
 )
+from aiformfiller.models import DetectedField as ParserDetectedField, FieldType
+from aiformfiller.pipeline import (
+    ParsedForm,
+    collect_answers_with_llm,
+    fill_parsed_form,
+    parse_pdf,
+)
+from aiformfiller.storage import SecureStorage, StorageError
 from services import FormPipeline, FormExtractionResult, FieldLayout
 
 OUTPUT_DIR = Path("output")
@@ -90,6 +98,11 @@ def _init_session_state() -> None:
         "filled_html": None,
         "preview_pdf_bytes": None,
         "preview_pdf_name": None,
+        "storage_password": None,
+        "stored_data": {},
+        "save_to_storage": False,
+        "use_parser_mode": False,  # Toggle between HTML and parser mode
+        "parsed_form": None,  # For parser-based mode
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -482,6 +495,14 @@ def _render_field_inputs(extracted: FormExtractionResult) -> None:
             else:
                 answers[answer_key] = st.text_input(label, value=default_value, key=widget_key)
         
+        # Add option to save to storage
+        if st.session_state.storage_password:
+            st.session_state.save_to_storage = st.checkbox(
+                "💾 Save responses to encrypted storage for future use",
+                value=st.session_state.save_to_storage,
+                help="Your data will be encrypted and stored locally"
+            )
+        
         col1, col2 = st.columns(2)
         preview_btn = col1.form_submit_button("Preview Filled PDF", type="secondary")
         confirm_btn = col2.form_submit_button("Confirm & Fill PDF", type="primary")
@@ -513,7 +534,23 @@ def _render_chat_interface(extracted: FormExtractionResult) -> None:
             )
             st.session_state.input_mode = "form"
             return
-        state = create_conversation(extracted.fields)
+        
+        # Convert HTML DetectedFields to Parser DetectedFields for compatibility
+        parser_fields = []
+        for field in extracted.fields:
+            # Create a simple ParserDetectedField with label
+            # We'll use a basic FieldType.TEXT for simplicity
+            label = field.label or field.name or "Field"
+            parser_field = ParserDetectedField(
+                label=label,
+                raw_label=label,
+                page=0,  # Not critical for chat
+                bbox=(0, 0, 0, 0),  # Not critical for chat
+                field_type=FieldType.TEXT,  # Default to text
+            )
+            parser_fields.append(parser_field)
+        
+        state = create_conversation(parser_fields)
         state = replace(
             state,
             form_name=str(extracted.metadata.get("form_name", "")),
@@ -584,6 +621,102 @@ def main() -> None:
         st.session_state.uploaded_pdf_path = _persist_pdf(pdf_bytes, uploaded_pdf.name)
     pdf_path = st.session_state.uploaded_pdf_path
 
+    # Try HTML-based extraction first (for interactive PDFs)
+    if st.session_state.extracted_form is None and st.session_state.parsed_form is None:
+        extracted_form = FORM_PIPELINE.extract(pdf_path)
+        
+        # Check if PDF has interactive form fields
+        metadata = extracted_form.metadata or {}
+        has_interactive_fields = metadata.get("has_form_fields", False) and extracted_form.fields
+        
+        if has_interactive_fields:
+            # Use HTML-based pipeline for interactive PDFs
+            st.session_state.extracted_form = extracted_form
+            st.session_state.use_parser_mode = False
+            st.info("🎯 Detected interactive PDF form - using HTML-based extraction")
+        else:
+            # Fallback to parser-based pipeline for underline-style PDFs
+            st.warning("⚠️ No interactive form fields detected. Trying underline-based parser...")
+            try:
+                parsed_form = parse_pdf(pdf_bytes)
+                if parsed_form.fields:
+                    st.session_state.parsed_form = parsed_form
+                    st.session_state.use_parser_mode = True
+                    st.success("✓ Detected underline-based fields")
+                else:
+                    st.session_state.extracted_form = extracted_form  # Keep empty HTML result
+                    st.session_state.use_parser_mode = False
+            except Exception as e:
+                st.error(f"Parser fallback failed: {str(e)}")
+                st.session_state.extracted_form = extracted_form
+                st.session_state.use_parser_mode = False
+    
+    # Use the appropriate mode
+    if st.session_state.use_parser_mode and st.session_state.parsed_form:
+        parsed_form = st.session_state.parsed_form
+        
+        if not parsed_form.fields:
+            st.warning("No underline-based fields were detected in the PDF.")
+            return
+        
+        st.caption(f"📄 Underline-based PDF detected")
+        
+        st.subheader("Detected Fields")
+        st.dataframe(
+            {
+                "Field": [field.label for field in parsed_form.fields],
+                "Page": [field.page + 1 for field in parsed_form.fields],
+                "Type": [field.field_type.value if hasattr(field.field_type, 'value') else str(field.field_type) for field in parsed_form.fields],
+            }
+        )
+        
+        st.subheader("Choose Input Mode")
+        mode_labels = ("Form Mode (Manual)", "Chat Mode (AI Assistant)")
+        current_index = 0 if st.session_state.input_mode == "form" else 1
+        selected_label = st.radio(
+            "Input method",
+            options=mode_labels,
+            index=current_index,
+            horizontal=True,
+            key="input_mode_selector_parser",
+        )
+        new_mode = "form" if selected_label == mode_labels[0] else "chat"
+        if st.session_state.input_mode != new_mode:
+            st.session_state.input_mode = new_mode
+            st.session_state.conversation_state = None
+        
+        # Render parser-based UI (simplified version for now)
+        if st.session_state.input_mode == "form":
+            st.subheader("Provide Field Values")
+            answers: Dict[str, str] = {}
+            with st.form("parser_field_input_form"):
+                for field in parsed_form.fields:
+                    default_value = st.session_state.answers.get(field.label, "")
+                    user_input = st.text_input(field.label, value=default_value)
+                    answers[field.label] = user_input if user_input else ""
+                
+                submitted = st.form_submit_button("Fill PDF")
+            
+            if submitted:
+                st.session_state.answers = answers
+                output_path = _build_output_path(st.session_state.uploaded_filename)
+                fill_parsed_form(parsed_form, answers, output_path.as_posix())
+                with output_path.open("rb") as fp:
+                    st.session_state.filled_pdf_bytes = fp.read()
+                    st.session_state.filled_pdf_name = output_path.name
+                st.success("PDF filled successfully!")
+                st.rerun()
+        
+        if st.session_state.filled_pdf_bytes:
+            st.download_button(
+                label="Download Filled PDF",
+                data=st.session_state.filled_pdf_bytes,
+                file_name=st.session_state.filled_pdf_name or "filled_form.pdf",
+                mime="application/pdf",
+            )
+        return
+
+    # HTML-based mode (original code)
     if st.session_state.extracted_form is None:
         extracted_form = FORM_PIPELINE.extract(pdf_path)
         st.session_state.extracted_form = extracted_form

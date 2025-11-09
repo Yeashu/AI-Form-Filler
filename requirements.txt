@@ -7,3 +7,5 @@ beautifulsoup4
 lxml
 weasyprint
 anthropic
+cryptography>=41.0.0
+rapidfuzz>=3.0.0
